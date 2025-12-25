@@ -1,0 +1,10 @@
+.venv
+data
+*.zip
+# Ignore everything under "Scientific Camera Interfaces"...
+vendor/Scientific Camera Interfaces/*
+# ...but keep SDK/Python Toolkit (need to unignore parents first)
+!vendor/Scientific Camera Interfaces/SDK/
+vendor/Scientific Camera Interfaces/SDK/*
+!vendor/Scientific Camera Interfaces/SDK/Python Toolkit/
+!vendor/Scientific Camera Interfaces/SDK/Python Toolkit/**
