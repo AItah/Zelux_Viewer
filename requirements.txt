@@ -1,0 +1,5 @@
+file:///C:/WC/SelfEmployee_wc/2025/STED%20with%20Nir/Code/BaslerTool/vendor/Scientific%20Camera%20Interfaces/SDK/Python%20Toolkit/thorlabs_tsi_camera_python_sdk_package.zip
+PyQt6
+pillow
+tifffile
+numpy

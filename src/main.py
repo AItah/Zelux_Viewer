@@ -1,5 +1,5 @@
 """
-Thorlabs CS165CU1 live-view utility with GUI controls.
+Thorlabs CS165CU1 live-view utility with GUI controls built on PyQt6.
 
 Features:
 - Connects to the first detected Thorlabs scientific camera (CS165CU1 compatible).
@@ -18,23 +18,21 @@ except Exception:
 
 import os
 import queue
+import sys
 import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass
-from tkinter import filedialog, messagebox
 from typing import Optional
 
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
+from PyQt6 import QtCore, QtGui, QtWidgets
 from thorlabs_tsi_sdk.tl_camera import Frame, TLCamera, TLCameraSDK
 from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
 from thorlabs_tsi_sdk.tl_mono_to_color_processor import MonoToColorProcessorSDK
 
 # Additional DLL path setup for repo-level dlls/{64,32}_lib
 def _add_repo_dll_path():
-    import sys
-
     is_64bits = sys.maxsize > 2**32
     arch_dir = "64_lib" if is_64bits else "32_lib"
     candidate = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "dlls", arch_dir))
@@ -68,7 +66,6 @@ class ImageAcquisitionThread(threading.Thread):
         self._stop_event = threading.Event()
         self._queue: queue.Queue[FramePayload] = queue.Queue(maxsize=2)
 
-        # Color pipeline setup
         self._is_color = self._camera.camera_sensor_type == SENSOR_TYPE.BAYER
         self._mono_to_color_sdk = None
         self._mono_to_color_processor = None
@@ -93,7 +90,6 @@ class ImageAcquisitionThread(threading.Thread):
 
     def _convert_frame(self, frame: Frame) -> FramePayload:
         if self._is_color:
-            # Convert Bayer to 24-bit RGB
             color_image_data = self._mono_to_color_processor.transform_to_24(
                 frame.image_buffer,
                 frame.image_buffer.shape[1],
@@ -120,7 +116,6 @@ class ImageAcquisitionThread(threading.Thread):
                 payload = self._convert_frame(frame)
                 self._queue.put_nowait(payload)
             except queue.Full:
-                # drop if UI is behind
                 pass
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"Acquisition error: {exc}")
@@ -131,8 +126,32 @@ class ImageAcquisitionThread(threading.Thread):
             self._mono_to_color_sdk.dispose()
 
 
-class CameraApp:
+class ImageLabel(QtWidgets.QLabel):
+    mouse_moved = QtCore.pyqtSignal(int, int)
+    mouse_clicked = QtCore.pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        self.setStyleSheet("background-color: #111;")
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent):
+        pos = event.position().toPoint()
+        self.mouse_moved.emit(pos.x(), pos.y())
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            self.mouse_clicked.emit(pos.x(), pos.y())
+        super().mousePressEvent(event)
+
+
+class CameraApp(QtWidgets.QMainWindow):
     def __init__(self):
+        super().__init__()
         os.makedirs(DATA_DIR, exist_ok=True)
         self.sdk = TLCameraSDK()
         camera_list = self.sdk.discover_available_cameras()
@@ -142,75 +161,110 @@ class CameraApp:
         self.camera.frames_per_trigger_zero_for_unlimited = 0
         self.camera.image_poll_timeout_ms = 50
 
-        self.root = tk.Tk()
-        self.root.title(f"Live View - {self.camera.name}")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        self.image_label = tk.Label(self.root)
-        self.image_label.pack(side=tk.TOP, padx=5, pady=5)
-        self.image_label.bind("<Motion>", self.on_mouse_move)
-        self.image_label.bind("<Button-1>", self.on_mouse_click)
-
-        self.status_var = tk.StringVar(value="Stopped")
-        self.coord_var = tk.StringVar(value="x: -, y: -, val: -")
-
         self.cross_pos = None
         self.last_payload: Optional[FramePayload] = None
-        self.photo = None
-
         self.acq_thread: Optional[ImageAcquisitionThread] = None
         self._live = False
 
-        self._build_controls()
-        self._poll_queue()
+        self.setWindowTitle(f"Live View - {self.camera.name}")
+        self._build_ui()
 
-    def _build_controls(self):
-        ctrl = tk.Frame(self.root)
-        ctrl.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        self.poll_timer = QtCore.QTimer(self)
+        self.poll_timer.setInterval(15)
+        self.poll_timer.timeout.connect(self._poll_queue)
+        self.poll_timer.start()
 
-        tk.Button(ctrl, text="Start Live", command=self.start_live).grid(row=0, column=0, padx=2, pady=2)
-        tk.Button(ctrl, text="Stop Live", command=self.stop_live).grid(row=0, column=1, padx=2, pady=2)
-        tk.Button(ctrl, text="Save Image", command=self.save_image).grid(row=0, column=2, padx=2, pady=2)
-        tk.Button(ctrl, text="Load Image", command=self.load_image).grid(row=0, column=3, padx=2, pady=2)
-        tk.Button(ctrl, text="Histogram", command=self.show_histogram).grid(row=0, column=4, padx=2, pady=2)
-        tk.Button(ctrl, text="Clear Cross", command=self.clear_cross).grid(row=0, column=5, padx=2, pady=2)
+    def _build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
 
-        param_frame = tk.LabelFrame(self.root, text="Parameters")
-        param_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        self.image_label = ImageLabel()
+        self.image_label.mouse_moved.connect(self.on_mouse_move)
+        self.image_label.mouse_clicked.connect(self.on_mouse_click)
+        layout.addWidget(
+            self.image_label,
+            alignment=QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop,
+        )
 
-        self.exposure_var = tk.DoubleVar(value=self.camera.exposure_time_us)
-        tk.Label(param_frame, text="Exposure (us)").grid(row=0, column=0, sticky="w")
-        tk.Entry(param_frame, textvariable=self.exposure_var, width=10).grid(row=0, column=1, padx=2)
-        tk.Button(param_frame, text="Set", command=self.set_exposure).grid(row=0, column=2, padx=2)
+        layout.addLayout(self._build_button_row())
+        layout.addWidget(self._build_param_group())
+        layout.addLayout(self._build_status_row())
 
-        # Gain slider based on camera range
+    def _build_button_row(self) -> QtWidgets.QHBoxLayout:
+        row = QtWidgets.QHBoxLayout()
+        buttons = [
+            ("Start Live", self.start_live),
+            ("Stop Live", self.stop_live),
+            ("Save Image", self.save_image),
+            ("Load Image", self.load_image),
+            ("Histogram", self.show_histogram),
+            ("Clear Cross", self.clear_cross),
+        ]
+        for text, handler in buttons:
+            btn = QtWidgets.QPushButton(text)
+            btn.clicked.connect(handler)
+            row.addWidget(btn)
+        row.addStretch(1)
+        return row
+
+    def _build_param_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Parameters")
+        grid = QtWidgets.QGridLayout(group)
+
+        self.exposure_spin = QtWidgets.QDoubleSpinBox()
+        self.exposure_spin.setRange(1, 10_000_000)
+        self.exposure_spin.setDecimals(1)
+        self.exposure_spin.setSingleStep(100)
+        self.exposure_spin.setValue(float(self.camera.exposure_time_us))
+        grid.addWidget(QtWidgets.QLabel("Exposure (us)"), 0, 0)
+        grid.addWidget(self.exposure_spin, 0, 1)
+        exposure_btn = QtWidgets.QPushButton("Set")
+        exposure_btn.clicked.connect(self.set_exposure)
+        grid.addWidget(exposure_btn, 0, 2)
+
         gain_min = getattr(self.camera.gain_range, "min", 0)
         gain_max = getattr(self.camera.gain_range, "max", 0)
-        self.gain_var = tk.IntVar(value=getattr(self.camera, "gain", gain_min))
-        tk.Label(param_frame, text="Gain").grid(row=1, column=0, sticky="w")
-        tk.Scale(param_frame, from_=gain_min, to=gain_max, orient=tk.HORIZONTAL, variable=self.gain_var,
-                 command=lambda _: self.set_gain(), length=200).grid(row=1, column=1, columnspan=2, sticky="we")
+        self.gain_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.gain_slider.setRange(int(gain_min), int(gain_max))
+        self.gain_slider.setValue(int(getattr(self.camera, "gain", gain_min)))
+        self.gain_slider.valueChanged.connect(self.set_gain)
+        grid.addWidget(QtWidgets.QLabel("Gain"), 1, 0)
+        grid.addWidget(self.gain_slider, 1, 1, 1, 2)
 
-        self.gamma_var = tk.DoubleVar(value=getattr(self.camera, "gamma", 1.0))
-        tk.Label(param_frame, text="Gamma").grid(row=2, column=0, sticky="w")
-        tk.Entry(param_frame, textvariable=self.gamma_var, width=10).grid(row=2, column=1, padx=2)
-        tk.Button(param_frame, text="Set", command=self.set_gamma).grid(row=2, column=2, padx=2)
+        self.gamma_spin = QtWidgets.QDoubleSpinBox()
+        self.gamma_spin.setRange(0.1, 10.0)
+        self.gamma_spin.setDecimals(2)
+        self.gamma_spin.setSingleStep(0.1)
+        self.gamma_spin.setValue(float(getattr(self.camera, "gamma", 1.0)))
+        grid.addWidget(QtWidgets.QLabel("Gamma"), 2, 0)
+        grid.addWidget(self.gamma_spin, 2, 1)
+        gamma_btn = QtWidgets.QPushButton("Set")
+        gamma_btn.clicked.connect(self.set_gamma)
+        grid.addWidget(gamma_btn, 2, 2)
 
-        status_frame = tk.Frame(self.root)
-        status_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-        tk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT, padx=5)
-        tk.Label(status_frame, textvariable=self.coord_var).pack(side=tk.LEFT, padx=5)
+        return group
+
+    def _build_status_row(self) -> QtWidgets.QHBoxLayout:
+        row = QtWidgets.QHBoxLayout()
+        self.status_label = QtWidgets.QLabel("Stopped")
+        self.coord_label = QtWidgets.QLabel("x: -, y: -, val: -")
+        row.addWidget(self.status_label)
+        row.addSpacing(12)
+        row.addWidget(self.coord_label)
+        row.addStretch(1)
+        return row
 
     def start_live(self):
         if self._live:
             return
         self._live = True
-        self.status_var.set("Starting...")
+        self.status_label.setText("Starting...")
         self.camera.arm(2)
         self.camera.issue_software_trigger()
         self.acq_thread = ImageAcquisitionThread(self.camera)
         self.acq_thread.start()
-        self.status_var.set("Live")
+        self.status_label.setText("Live")
 
     def stop_live(self):
         self._live = False
@@ -222,29 +276,28 @@ class CameraApp:
             self.camera.disarm()
         except Exception:
             pass
-        self.status_var.set("Stopped")
+        self.status_label.setText("Stopped")
 
     def set_exposure(self):
         try:
-            val = float(self.exposure_var.get())
-            self.camera.exposure_time_us = int(val)
+            self.camera.exposure_time_us = int(self.exposure_spin.value())
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to set exposure: {exc}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set exposure: {exc}")
 
-    def set_gain(self):
+    def set_gain(self, _value=None):
         try:
-            self.camera.gain = int(self.gain_var.get())
+            self.camera.gain = int(self.gain_slider.value())
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to set gain: {exc}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set gain: {exc}")
 
     def set_gamma(self):
         if not hasattr(self.camera, "gamma"):
-            messagebox.showinfo("Not supported", "Gamma control not supported on this camera.")
+            QtWidgets.QMessageBox.information(self, "Not supported", "Gamma control not supported on this camera.")
             return
         try:
-            self.camera.gamma = float(self.gamma_var.get())
+            self.camera.gamma = float(self.gamma_spin.value())
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to set gamma: {exc}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set gamma: {exc}")
 
     def _poll_queue(self):
         if self.acq_thread:
@@ -255,15 +308,14 @@ class CameraApp:
                 self._display_frame(payload)
             except queue.Empty:
                 pass
-        self.root.after(15, self._poll_queue)
 
     def _display_frame(self, payload: FramePayload):
         img = payload.pil_image.copy()
         if self.cross_pos:
             img = self._draw_cross(img, self.cross_pos)
-        self.photo = ImageTk.PhotoImage(img)
-        self.image_label.config(image=self.photo)
-        self.image_label.image = self.photo
+        pixmap = self._pil_to_qpixmap(img)
+        self.image_label.setPixmap(pixmap)
+        self.image_label.adjustSize()
 
     @staticmethod
     def _draw_cross(image: Image.Image, pos):
@@ -282,25 +334,64 @@ class CameraApp:
                 pixels[x, y + dy] = color
         return image
 
+    @staticmethod
+    def _pil_to_qpixmap(image: Image.Image) -> QtGui.QPixmap:
+        if image.mode == "RGB":
+            data = image.tobytes()
+            qimage = QtGui.QImage(
+                data,
+                image.width,
+                image.height,
+                image.width * 3,
+                QtGui.QImage.Format.Format_RGB888,
+            ).copy()
+        elif image.mode == "L":
+            data = image.tobytes()
+            qimage = QtGui.QImage(
+                data,
+                image.width,
+                image.height,
+                image.width,
+                QtGui.QImage.Format.Format_Grayscale8,
+            ).copy()
+        else:
+            rgb_image = image.convert("RGB")
+            data = rgb_image.tobytes()
+            qimage = QtGui.QImage(
+                data,
+                rgb_image.width,
+                rgb_image.height,
+                rgb_image.width * 3,
+                QtGui.QImage.Format.Format_RGB888,
+            ).copy()
+        return QtGui.QPixmap.fromImage(qimage)
+
     def save_image(self):
         if not self.last_payload:
-            messagebox.showinfo("No image", "No image to save.")
+            QtWidgets.QMessageBox.information(self, "No image", "No image to save.")
             return
         default_path = os.path.join(DATA_DIR, f"capture_{int(time.time())}.png")
-        path = filedialog.asksaveasfilename(defaultextension=".png", initialfile=os.path.basename(default_path),
-                                            initialdir=DATA_DIR, filetypes=[("PNG", "*.png"), ("TIFF", "*.tiff *.tif"),
-                                                                            ("All files", "*.*")])
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Image",
+            default_path,
+            "PNG Files (*.png);;TIFF Files (*.tif *.tiff);;All Files (*.*)",
+        )
         if not path:
             return
         try:
             self.last_payload.pil_image.save(path)
-            self.status_var.set(f"Saved {path}")
+            self.status_label.setText(f"Saved {path}")
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to save: {exc}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save: {exc}")
 
     def load_image(self):
-        path = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.tif *.tiff"), ("All", "*.*")],
-                                          initialdir=DATA_DIR)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open Image",
+            DATA_DIR,
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff);;All Files (*.*)",
+        )
         if not path:
             return
         try:
@@ -308,62 +399,75 @@ class CameraApp:
             np_img = np.array(img)
             payload = FramePayload(pil_image=img, np_image=np_img, frame_count=-1)
             self.last_payload = payload
+            self.cross_pos = None
             self._display_frame(payload)
-            self.status_var.set(f"Loaded {path}")
+            self.status_label.setText(f"Loaded {path}")
         except Exception as exc:
-            messagebox.showerror("Error", f"Failed to load image: {exc}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load image: {exc}")
 
     def show_histogram(self):
         if not self.last_payload:
-            messagebox.showinfo("No image", "No image to analyze.")
+            QtWidgets.QMessageBox.information(self, "No image", "No image to analyze.")
             return
         data = self.last_payload.np_image
         if data.ndim == 3:
             data = np.mean(data, axis=2)
-        hist, bins = np.histogram(data.flatten(), bins=256, range=[0, 255])
-        hist_window = tk.Toplevel(self.root)
-        hist_window.title("Histogram")
-        canvas = tk.Canvas(hist_window, width=512, height=200, bg="white")
-        canvas.pack()
-        hist = hist / hist.max() if hist.max() > 0 else hist
+        hist, _ = np.histogram(data.flatten(), bins=256, range=[0, 255])
+        hist = hist.astype(np.float64)
+        if hist.max() > 0:
+            hist = hist / hist.max()
+
+        width, height = 512, 200
+        image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_RGB32)
+        image.fill(QtGui.QColor("white"))
+        painter = QtGui.QPainter(image)
+        painter.setPen(QtGui.QColor("blue"))
+        painter.setBrush(QtGui.QColor("blue"))
         for i, v in enumerate(hist):
-            x0 = i * 2
-            x1 = x0 + 1
-            y0 = 200
-            y1 = 200 - int(v * 180)
-            canvas.create_rectangle(x0, y0, x1, y1, fill="blue", outline="")
+            x = i * 2
+            bar_height = int(v * (height - 20))
+            painter.drawRect(x, height - bar_height, 1, bar_height)
+        painter.end()
+
+        label = QtWidgets.QLabel()
+        label.setPixmap(QtGui.QPixmap.fromImage(image))
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Histogram")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(label)
+        dialog.setLayout(layout)
+        dialog.exec()
 
     def clear_cross(self):
         self.cross_pos = None
         if self.last_payload:
             self._display_frame(self.last_payload)
 
-    def on_mouse_move(self, event):
+    def on_mouse_move(self, x: int, y: int):
         if not self.last_payload:
+            self.coord_label.setText("x: -, y: -, val: -")
             return
-        x, y = int(event.x), int(event.y)
         img = self.last_payload.np_image
         h, w = img.shape[:2]
         if 0 <= x < w and 0 <= y < h:
-            if img.ndim == 2:
-                val = img[y, x]
-            else:
-                val = img[y, x].tolist()
-            self.coord_var.set(f"x: {x}, y: {y}, val: {val}")
+            val = img[y, x]
+            if isinstance(val, np.ndarray):
+                val = val.tolist()
+            self.coord_label.setText(f"x: {x}, y: {y}, val: {val}")
         else:
-            self.coord_var.set("x: -, y: -, val: -")
+            self.coord_label.setText("x: -, y: -, val: -")
 
-    def on_mouse_click(self, event):
+    def on_mouse_click(self, x: int, y: int):
         if not self.last_payload:
             return
-        x, y = int(event.x), int(event.y)
         img = self.last_payload.np_image
         h, w = img.shape[:2]
         if 0 <= x < w and 0 <= y < h:
             self.cross_pos = (x, y)
             self._display_frame(self.last_payload)
 
-    def on_close(self):
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        self.poll_timer.stop()
         self.stop_live()
         try:
             self.camera.dispose()
@@ -373,15 +477,14 @@ class CameraApp:
             self.sdk.dispose()
         except Exception:
             pass
-        self.root.destroy()
-
-    def run(self):
-        self.root.mainloop()
+        super().closeEvent(event)
 
 
 def main():
-    app = CameraApp()
-    app.run()
+    qt_app = QtWidgets.QApplication(sys.argv)
+    window = CameraApp()
+    window.show()
+    sys.exit(qt_app.exec())
 
 
 if __name__ == "__main__":
