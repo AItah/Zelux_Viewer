@@ -1630,7 +1630,6 @@ class CameraApp(QtWidgets.QMainWindow):
             self.line_fit_status.setText("Line fit: select two points first.")
             return
         self._compute_line_fit(self._line_points[0], self._line_points[1])
-        self._line_edit_mode = False
         self._sync_panning_enabled()
 
     def _moment_center_and_cov(self, data: np.ndarray):
@@ -1722,8 +1721,6 @@ class CameraApp(QtWidgets.QMainWindow):
         self._axis_fit_results = {"H": fit_h, "V": fit_v}
         self._axis_center_px = (cx, cy)
         self.cross_pos = (int(round(cx)), int(round(cy)))
-        # clear manual line overlay after 360 fit
-        self._line_points = []
 
         self._update_axis_plot(
             self.axis_plot_h,
@@ -1786,7 +1783,7 @@ class CameraApp(QtWidgets.QMainWindow):
         ):
             if self._handle_wheel_zoom(event, obj):
                 return True
-        elif obj is getattr(self, "image_label", None) and self._line_edit_mode:
+        elif obj is getattr(self, "image_label", None) and len(self._line_points) == 2:
             if event.type() == QtCore.QEvent.Type.MouseButtonPress:
                 if self._start_line_drag(event):
                     return True
