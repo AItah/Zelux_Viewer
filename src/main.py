@@ -316,6 +316,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self._line_drag_mode: Optional[str] = None
         self._axis_lines: list[tuple[tuple[int, int], tuple[int, int], QtGui.QColor]] = []
         self._axis_fit_results = {}
+        self._axis_center_px: Optional[tuple[float, float]] = None
 
         self.setWindowTitle("Live View - No camera")
         self._build_ui()
@@ -439,9 +440,9 @@ class CameraApp(QtWidgets.QMainWindow):
         layout.addWidget(info_label)
 
         btn_row = QtWidgets.QHBoxLayout()
-        self.gauss_btn = QtWidgets.QPushButton("Gaussian Fit @ Cross")
-        self.gauss_btn.clicked.connect(self.compute_gaussian_fit)
-        btn_row.addWidget(self.gauss_btn)
+        # self.gauss_btn = QtWidgets.QPushButton("Gaussian Fit @ Cross")
+        # self.gauss_btn.clicked.connect(self.compute_gaussian_fit)
+        # btn_row.addWidget(self.gauss_btn)
         self.line_fit_btn = QtWidgets.QPushButton("2-Point Line Fit")
         self.line_fit_btn.clicked.connect(self.start_line_fit_selection)
         btn_row.addWidget(self.line_fit_btn)
@@ -1356,13 +1357,21 @@ class CameraApp(QtWidgets.QMainWindow):
         return image
 
     def compute_gaussian_fit(self):
-        if not self.last_payload or not self.cross_pos:
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "No selection", "Select a cross location first.")
+            return
+        center = None
+        if self._axis_center_px:
+            center = self._axis_center_px
+        elif self.cross_pos:
+            center = self.cross_pos
+        if center is None:
             QtWidgets.QMessageBox.information(self, "No selection", "Select a cross location first.")
             return
         data = self.last_payload.np_image
         if data.ndim == 3:
             data = np.mean(data, axis=2)
-        x0, y0 = self.cross_pos
+        x0, y0 = center
         h, w = data.shape
         yy, xx = np.indices((h, w))
 
@@ -1499,6 +1508,8 @@ class CameraApp(QtWidgets.QMainWindow):
             self.line_fit_status.setText("Line fit: select two points first.")
             return
         self._compute_line_fit(self._line_points[0], self._line_points[1])
+        self._line_edit_mode = False
+        self._sync_panning_enabled()
 
     def _moment_center_and_cov(self, data: np.ndarray):
         baseline = float(np.percentile(data, 10.0))
@@ -1587,6 +1598,8 @@ class CameraApp(QtWidgets.QMainWindow):
             (vert_p1, vert_p2, QtGui.QColor(255, 120, 0)),
         ]
         self._axis_fit_results = {"H": fit_h, "V": fit_v}
+        self._axis_center_px = (cx, cy)
+        self.cross_pos = (int(round(cx)), int(round(cy)))
 
         self._update_axis_plot(
             self.axis_plot_h,
@@ -1614,7 +1627,20 @@ class CameraApp(QtWidgets.QMainWindow):
             f"H FWHM={fit_h['fwhm_px']:.2f}px ({fit_h['fwhm_mm']:.3f}mm); "
             f"V FWHM={fit_v['fwhm_px']:.2f}px ({fit_v['fwhm_mm']:.3f}mm)"
         )
+        # Build a Gaussian overlay using the 360 fit widths and center for correct scale
+        self._gauss_fit = {
+            "mu_x": cx,
+            "mu_y": cy,
+            "w1e2_major": fit_h["w1e2_px"],
+            "w1e2_minor": fit_v["w1e2_px"],
+            "w1e2_major_mm": fit_h["w1e2_mm"],
+            "w1e2_minor_mm": fit_v["w1e2_mm"],
+            "angle_deg": 0.0,
+            "label_text": f"{fit_h['w1e2_px']*2:.2f}px ({fit_h['w1e2_mm']*2:.3f}mm) x {fit_v['w1e2_px']*2:.2f}px ({fit_v['w1e2_mm']*2:.3f}mm)",
+        }
         self._refresh_image_view()
+        self._line_edit_mode = False
+        self._sync_panning_enabled()
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "hist_window", None):
@@ -1903,8 +1929,6 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def on_mouse_click(self, x: int, y: int):
         if not self.last_payload:
-            return
-        if self._line_edit_mode and not self._line_select_mode:
             return
         scale = self._last_render_scale if self._last_render_scale else 1.0
         img = self.last_payload.np_image
