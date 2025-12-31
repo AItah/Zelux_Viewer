@@ -1030,7 +1030,9 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.end()
         return QtGui.QPixmap.fromImage(image)
 
-    def _update_line_plot(self, x_axis: np.ndarray, profile: np.ndarray, fit_curve: np.ndarray, length_mm: float):
+    def _update_line_plot(
+        self, x_axis: np.ndarray, profile: np.ndarray, fit_curve: np.ndarray, length_mm: float, fwhm_mm: float, waist_mm: float
+    ):
         width = 540
         height = 240
         margin = 36
@@ -1070,7 +1072,11 @@ class CameraApp(QtWidgets.QMainWindow):
             )
 
         painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
-        painter.drawText(margin, margin - 6, "Line profile (cyan) and Gaussian fit (orange)")
+        painter.drawText(
+            margin,
+            margin - 6,
+            f"Line profile (cyan) & fit (orange) | 2*w={waist_mm:.3f}mm, FWHM={fwhm_mm:.3f}mm",
+        )
         painter.drawText(
             width // 2 - 60,
             height - 6,
@@ -1084,7 +1090,17 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.end()
         self.line_plot_label.setPixmap(QtGui.QPixmap.fromImage(img))
 
-    def _update_axis_plot(self, target: QtWidgets.QLabel, title: str, x_axis: np.ndarray, profile: np.ndarray, fit_curve: np.ndarray, length_mm: float):
+    def _update_axis_plot(
+        self,
+        target: QtWidgets.QLabel,
+        title: str,
+        x_axis: np.ndarray,
+        profile: np.ndarray,
+        fit_curve: np.ndarray,
+        length_mm: float,
+        fwhm_mm: float,
+        waist_mm: float,
+    ):
         width = 420
         height = 160
         margin = 32
@@ -1120,7 +1136,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 QtCore.QPointF(scale_x(x_axis[i]), scale_y(fit_curve[i])),
             )
         painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
-        painter.drawText(margin, margin - 6, title)
+        painter.drawText(margin, margin - 6, f"{title} | 2*w={waist_mm:.3f}mm, FWHM={fwhm_mm:.3f}mm")
         painter.drawText(
             width // 2 - 70,
             height - 6,
@@ -1458,8 +1474,6 @@ class CameraApp(QtWidgets.QMainWindow):
             "length_px": length_px,
             "length_mm": length_mm,
         }
-        self._update_line_plot(px_axis, profile, fit_curve, length_mm)
-
         px_step = length_px / max(len(px_axis) - 1, 1)
         mm_step = length_mm / max(len(px_axis) - 1, 1)
         sigma_px = sigma * px_step
@@ -1470,6 +1484,7 @@ class CameraApp(QtWidgets.QMainWindow):
         w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
         mu_pos_px = (mu / max(len(px_axis) - 1, 1)) * length_px
         mu_pos_mm = (mu / max(len(px_axis) - 1, 1)) * length_mm
+        self._update_line_plot(px_axis, profile, fit_curve, length_mm, fwhm_mm, w1e2_mm)
         self.line_fit_status.setText(
             "Line fit OK: "
             f"mu={mu_pos_px:.2f}px ({mu_pos_mm:.3f}mm), "
@@ -1580,6 +1595,8 @@ class CameraApp(QtWidgets.QMainWindow):
             fit_h["profile"],
             fit_h["fit_curve"],
             fit_h["length_mm"],
+            fit_h["fwhm_mm"],
+            fit_h["w1e2_mm"],
         )
         self._update_axis_plot(
             self.axis_plot_v,
@@ -1588,6 +1605,8 @@ class CameraApp(QtWidgets.QMainWindow):
             fit_v["profile"],
             fit_v["fit_curve"],
             fit_v["length_mm"],
+            fit_v["fwhm_mm"],
+            fit_v["w1e2_mm"],
         )
 
         self.axis_fit_status.setText(
