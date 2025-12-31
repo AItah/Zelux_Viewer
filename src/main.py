@@ -1851,7 +1851,8 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self.last_payload:
             QtWidgets.QMessageBox.information(self, "No image", "No image to save.")
             return
-        default_path = os.path.join(DATA_DIR, f"capture_{int(time.time())}.png")
+        last_dir = self._settings.value("last_image_dir", DATA_DIR, type=str)
+        default_path = os.path.join(last_dir, f"capture_{int(time.time())}.png")
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save Image",
@@ -1863,14 +1864,16 @@ class CameraApp(QtWidgets.QMainWindow):
         try:
             self.last_payload.pil_image.save(path)
             self.status_label.setText(f"Saved {path}")
+            self._settings.setValue("last_image_dir", os.path.dirname(path))
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save: {exc}")
 
     def load_image(self):
+        last_dir = self._settings.value("last_image_dir", DATA_DIR, type=str)
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Open Image",
-            DATA_DIR,
+            last_dir,
             "Images (*.png *.jpg *.jpeg *.tif *.tiff);;All Files (*.*)",
         )
         if not path:
@@ -1882,6 +1885,7 @@ class CameraApp(QtWidgets.QMainWindow):
             self.cross_pos = None
             self._display_frame(payload)
             self.status_label.setText(f"Loaded {path}")
+            self._settings.setValue("last_image_dir", os.path.dirname(path))
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load image: {exc}")
 
