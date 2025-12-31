@@ -317,7 +317,9 @@ class CameraApp(QtWidgets.QMainWindow):
         self._axis_lines: list[tuple[tuple[int, int], tuple[int, int], QtGui.QColor]] = []
         self._axis_fit_results = {}
         self._axis_center_px: Optional[tuple[float, float]] = None
+        self._settings = QtCore.QSettings("BaslerTool", "Viewer")
 
+        self._restore_window_state(self, "main_window")
         self.setWindowTitle("Live View - No camera")
         self._build_ui()
 
@@ -372,9 +374,11 @@ class CameraApp(QtWidgets.QMainWindow):
 
         self.controls_window = self._build_controls_window()
         self.controls_window.installEventFilter(self)
-        QtCore.QTimer.singleShot(
-            0, lambda: self._position_window_near_main(self.controls_window, QtCore.QPoint(14, 14))
-        )
+        restored_controls = self._restore_window_state(self.controls_window, "controls_window")
+        if not restored_controls:
+            QtCore.QTimer.singleShot(
+                0, lambda: self._position_window_near_main(self.controls_window, QtCore.QPoint(14, 14))
+            )
         self.controls_window.show()
 
         self.hist_window = self._build_hist_window()
@@ -382,6 +386,9 @@ class CameraApp(QtWidgets.QMainWindow):
 
         self.fit_window = self._build_fit_window()
         self.fit_window.installEventFilter(self)
+
+        self._restore_window_state(self.hist_window, "hist_window")
+        self._restore_window_state(self.fit_window, "fit_window")
 
         self._sync_panning_enabled()
 
@@ -506,6 +513,44 @@ class CameraApp(QtWidgets.QMainWindow):
             target.setX(min(max(avail.left(), target.x()), max_x))
             target.setY(min(max(avail.top(), target.y()), max_y))
         window.move(target)
+
+    def _restore_window_state(self, window: QtWidgets.QWidget, key_prefix: str) -> bool:
+        if not window:
+            return False
+        x = self._settings.value(f"{key_prefix}/x", None, type=int)
+        y = self._settings.value(f"{key_prefix}/y", None, type=int)
+        w = self._settings.value(f"{key_prefix}/w", None, type=int)
+        h = self._settings.value(f"{key_prefix}/h", None, type=int)
+        visible = self._settings.value(f"{key_prefix}/visible", None, type=bool)
+        restored = False
+        if None not in (x, y, w, h):
+            geom = QtCore.QRect(x, y, max(50, w), max(50, h))
+            screen = QtGui.QGuiApplication.screenAt(geom.center())
+            if screen is None:
+                screen = QtGui.QGuiApplication.primaryScreen()
+            if screen:
+                avail = screen.availableGeometry()
+                if not avail.contains(geom):
+                    geom.moveTopLeft(avail.topLeft())
+            window.setGeometry(geom)
+            restored = True
+        if visible is True:
+            window.show()
+            restored = True
+        elif visible is False:
+            window.hide()
+            restored = True
+        return restored
+
+    def _save_window_state(self, window: QtWidgets.QWidget, key_prefix: str):
+        if not window:
+            return
+        geom = window.geometry()
+        self._settings.setValue(f"{key_prefix}/x", geom.x())
+        self._settings.setValue(f"{key_prefix}/y", geom.y())
+        self._settings.setValue(f"{key_prefix}/w", geom.width())
+        self._settings.setValue(f"{key_prefix}/h", geom.height())
+        self._settings.setValue(f"{key_prefix}/visible", window.isVisible())
 
     def _build_button_row(self) -> QtWidgets.QHBoxLayout:
         row = QtWidgets.QHBoxLayout()
@@ -1997,11 +2042,15 @@ class CameraApp(QtWidgets.QMainWindow):
             pass
         try:
             if getattr(self, "controls_window", None):
+                self._save_window_state(self.controls_window, "controls_window")
                 self.controls_window.close()
             if getattr(self, "hist_window", None):
+                self._save_window_state(self.hist_window, "hist_window")
                 self.hist_window.close()
             if getattr(self, "fit_window", None):
+                self._save_window_state(self.fit_window, "fit_window")
                 self.fit_window.close()
+            self._save_window_state(self, "main_window")
         except Exception:
             pass
         super().closeEvent(event)
