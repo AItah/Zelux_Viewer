@@ -3,7 +3,6 @@ data
 *.zip
 # Ignore everything under
 build/*
-dist/*
 # ...but keep ... Toolkit (need to unignore parents first)
 
 # Ignore everything under "Scientific Camera Interfaces"...

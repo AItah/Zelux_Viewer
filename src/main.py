@@ -568,36 +568,46 @@ class CameraApp(QtWidgets.QMainWindow):
         self._settings.setValue(f"{key_prefix}/h", geom.height())
         self._settings.setValue(f"{key_prefix}/visible", window.isVisible())
 
-    def _build_button_row(self) -> QtWidgets.QHBoxLayout:
-        row = QtWidgets.QHBoxLayout()
+    def _build_button_row(self) -> QtWidgets.QVBoxLayout:
+        layout = QtWidgets.QVBoxLayout()
+
+        row1 = QtWidgets.QHBoxLayout()
         self.connect_btn = QtWidgets.QPushButton("Connect Camera")
         self.connect_btn.clicked.connect(self.connect_camera)
-        row.addWidget(self.connect_btn)
-        buttons = [
+        row1.addWidget(self.connect_btn)
+        for text, handler in [
             ("Start Live", self.start_live),
             ("Stop Live", self.stop_live),
             ("Save Image", self.save_image),
             ("Load Image", self.load_image),
-            ("Clear Cross", self.clear_cross),
-            # ("Zoom In", self.zoom_in),
-            # ("Zoom Out", self.zoom_out),
-            ("Fit", self.fit_to_window),
-        ]
-        for text, handler in buttons:
+        ]:
             btn = QtWidgets.QPushButton(text)
             btn.clicked.connect(handler)
-            row.addWidget(btn)
+            row1.addWidget(btn)
+        row1.addStretch(1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        for text, handler in [
+            ("Clear Cross", self.clear_cross),
+            ("Fit", self.fit_to_window),
+        ]:
+            btn = QtWidgets.QPushButton(text)
+            btn.clicked.connect(handler)
+            row2.addWidget(btn)
         self.hist_checkbox = QtWidgets.QCheckBox("Histogram")
         self.hist_checkbox.stateChanged.connect(self.toggle_histogram)
-        row.addWidget(self.hist_checkbox)
+        row2.addWidget(self.hist_checkbox)
         self.fit_checkbox = QtWidgets.QCheckBox("Fit Window")
         self.fit_checkbox.stateChanged.connect(self.toggle_fit_window)
-        row.addWidget(self.fit_checkbox)
+        row2.addWidget(self.fit_checkbox)
         self.gray_checkbox = QtWidgets.QCheckBox("Grayscale")
         self.gray_checkbox.stateChanged.connect(self.toggle_grayscale)
-        row.addWidget(self.gray_checkbox)
-        row.addStretch(1)
-        return row
+        row2.addWidget(self.gray_checkbox)
+        row2.addStretch(1)
+
+        layout.addLayout(row1)
+        layout.addLayout(row2)
+        return layout
 
     def _build_param_group(self) -> QtWidgets.QGroupBox:
         group = QtWidgets.QGroupBox("Parameters")
@@ -617,21 +627,32 @@ class CameraApp(QtWidgets.QMainWindow):
         self.exposure_spin.setDecimals(1)
         self.exposure_spin.setSingleStep(100)
         self.exposure_spin.setValue(exp_val)
+        self.exposure_spin.setMaximumWidth(120)
         grid.addWidget(QtWidgets.QLabel("Exposure (us)"), 0, 0)
         grid.addWidget(self.exposure_spin, 0, 1)
-        exposure_btn = QtWidgets.QPushButton("Set")
-        exposure_btn.clicked.connect(self.set_exposure)
-        grid.addWidget(exposure_btn, 0, 2)
-        self.exposure_value_label = QtWidgets.QLabel(f"{int(exp_val)} us")
-        grid.addWidget(self.exposure_value_label, 0, 3)
-
         self.exposure_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.exposure_slider.setRange(exp_min, exp_max)
         self.exposure_slider.setValue(int(exp_val))
         self.exposure_slider.setSingleStep(max(1, (exp_max - exp_min) // 500))
-        self.exposure_slider.setMaximumWidth(220)
+        self.exposure_slider.setMaximumWidth(120)
         self.exposure_slider.valueChanged.connect(self._on_exposure_slider)
-        grid.addWidget(self.exposure_slider, 1, 0, 1, 4)
+        grid.addWidget(self.exposure_slider, 0, 2, 1, 2)
+        exposure_btn = QtWidgets.QPushButton("Set")
+        exposure_btn.setMaximumWidth(70)
+        exposure_btn.clicked.connect(self.set_exposure)
+        grid.addWidget(exposure_btn, 0, 4)
+        self.exposure_value_label = QtWidgets.QLabel(f"{int(exp_val)} us")
+        grid.addWidget(self.exposure_value_label, 0, 5)
+
+        fine_min, fine_max = 1, 1_000_000  # 1 us to 1000 ms
+        grid.addWidget(QtWidgets.QLabel("Fine Exp (us)"), 1, 0)
+        self.exposure_fine_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.exposure_fine_slider.setRange(fine_min, fine_max)
+        self.exposure_fine_slider.setValue(int(min(max(exp_val, fine_min), fine_max)))
+        self.exposure_fine_slider.setSingleStep(max(1, (fine_max - fine_min) // 500))
+        self.exposure_fine_slider.setMaximumWidth(120)
+        self.exposure_fine_slider.valueChanged.connect(self._on_exposure_slider_fine)
+        grid.addWidget(self.exposure_fine_slider, 1, 1, 1, 5)
 
         gain_range = getattr(self.camera, "gain_range", None)
         gain_min = getattr(gain_range, "min", 0)
@@ -645,6 +666,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self.gain_slider.valueChanged.connect(self._on_gain_slider)
         self.gain_value_label = QtWidgets.QLabel(str(int(getattr(self.camera, "gain", gain_val))))
         grid.addWidget(QtWidgets.QLabel("Gain"), 2, 0)
+        self.gain_slider.setMaximumWidth(150)
         grid.addWidget(self.gain_slider, 2, 1, 1, 2)
         grid.addWidget(self.gain_value_label, 2, 3)
 
@@ -665,17 +687,19 @@ class CameraApp(QtWidgets.QMainWindow):
         self.mm_px_x_spin.setDecimals(7)
         self.mm_px_x_spin.setSingleStep(0.001)
         self.mm_px_x_spin.setValue(self.mm_per_px_x)
+        self.mm_px_x_spin.setMaximumWidth(140)
         self.mm_px_x_spin.valueChanged.connect(lambda v: self._update_mm_scale(v, axis="x"))
         grid.addWidget(self.mm_px_x_spin, 4, 1)
 
-        grid.addWidget(QtWidgets.QLabel("mm/px Y"), 5, 0)
+        grid.addWidget(QtWidgets.QLabel("mm/px Y"), 4, 2)
         self.mm_px_y_spin = QtWidgets.QDoubleSpinBox()
         self.mm_px_y_spin.setRange(0.0001, 10000.0)
         self.mm_px_y_spin.setDecimals(7)
         self.mm_px_y_spin.setSingleStep(0.001)
         self.mm_px_y_spin.setValue(self.mm_per_px_y)
+        self.mm_px_y_spin.setMaximumWidth(140)
         self.mm_px_y_spin.valueChanged.connect(lambda v: self._update_mm_scale(v, axis="y"))
-        grid.addWidget(self.mm_px_y_spin, 5, 1)
+        grid.addWidget(self.mm_px_y_spin, 4, 3)
 
         return group
 
@@ -693,6 +717,7 @@ class CameraApp(QtWidgets.QMainWindow):
         widgets = [
             self.exposure_spin,
             self.exposure_slider,
+            self.exposure_fine_slider,
             self.gain_slider,
             # self.gamma_spin,
         ]
@@ -887,6 +912,11 @@ class CameraApp(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set exposure: {exc}")
 
+    def _on_exposure_slider_fine(self, value: int):
+        if not self.camera:
+            return
+        self._on_exposure_slider(value)
+
     def _apply_exposure(self, value: int):
         if not self.camera:
             raise RuntimeError("No camera connected")
@@ -901,6 +931,11 @@ class CameraApp(QtWidgets.QMainWindow):
         self.exposure_spin.blockSignals(True)
         self.exposure_spin.setValue(float(value))
         self.exposure_spin.blockSignals(False)
+        if getattr(self, "exposure_fine_slider", None):
+            self.exposure_fine_slider.blockSignals(True)
+            fine_min, fine_max = self.exposure_fine_slider.minimum(), self.exposure_fine_slider.maximum()
+            self.exposure_fine_slider.setValue(int(min(max(value, fine_min), fine_max)))
+            self.exposure_fine_slider.blockSignals(False)
         self.exposure_value_label.setText(f"{int(value)} us")
 
     def _on_gain_slider(self, value: int):
