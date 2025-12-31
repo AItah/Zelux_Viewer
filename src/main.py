@@ -307,6 +307,10 @@ class CameraApp(QtWidgets.QMainWindow):
         self._hist_window_positioned = False
         self._fit_window_positioned = False
         self._in_hist_update = False
+        self._line_select_mode = False
+        self._line_points: list[tuple[int, int]] = []
+        self._line_profile = None
+        self._line_fit = None
 
         self.setWindowTitle("Live View - No camera")
         self._build_ui()
@@ -433,12 +437,24 @@ class CameraApp(QtWidgets.QMainWindow):
         self.gauss_btn = QtWidgets.QPushButton("Gaussian Fit @ Cross")
         self.gauss_btn.clicked.connect(self.compute_gaussian_fit)
         btn_row.addWidget(self.gauss_btn)
+        self.line_fit_btn = QtWidgets.QPushButton("2-Point Line Fit")
+        self.line_fit_btn.clicked.connect(self.start_line_fit_selection)
+        btn_row.addWidget(self.line_fit_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
         self.gauss_result_label = QtWidgets.QLabel("Gauss X: -, Y: -")
         self.gauss_result_label.setWordWrap(True)
         layout.addWidget(self.gauss_result_label)
+
+        self.line_fit_status = QtWidgets.QLabel("Line fit: not computed.")
+        self.line_fit_status.setWordWrap(True)
+        layout.addWidget(self.line_fit_status)
+
+        self.line_plot_label = QtWidgets.QLabel()
+        self.line_plot_label.setMinimumHeight(180)
+        self.line_plot_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.line_plot_label)
 
         window.hide()
         return window
@@ -987,12 +1003,58 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.end()
         return QtGui.QPixmap.fromImage(image)
 
+    def _update_line_plot(self, x_axis: np.ndarray, profile: np.ndarray, fit_curve: np.ndarray):
+        width = 540
+        height = 240
+        margin = 36
+        if x_axis.size == 0:
+            self.line_plot_label.clear()
+            return
+        y_min = float(min(np.min(profile), np.min(fit_curve)))
+        y_max = float(max(np.max(profile), np.max(fit_curve)))
+        if y_max - y_min < 1e-6:
+            y_max = y_min + 1.0
+        def scale_x(x):
+            return margin + (x - x_axis[0]) / max(1e-9, x_axis[-1] - x_axis[0]) * (width - 2 * margin)
+        def scale_y(y):
+            return height - margin - (y - y_min) / (y_max - y_min) * (height - 2 * margin)
+
+        img = QtGui.QImage(width, height, QtGui.QImage.Format.Format_ARGB32)
+        img.fill(QtGui.QColor(12, 12, 12, 255))
+        painter = QtGui.QPainter(img)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(QtGui.QPen(QtGui.QColor(70, 70, 70), 1))
+        painter.drawRect(margin, margin, width - 2 * margin, height - 2 * margin)
+
+        # Profile line
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255), 2))
+        for i in range(1, len(x_axis)):
+            painter.drawLine(
+                QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(profile[i - 1])),
+                QtCore.QPointF(scale_x(x_axis[i]), scale_y(profile[i])),
+            )
+
+        # Fit line
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 150, 0), 2))
+        for i in range(1, len(x_axis)):
+            painter.drawLine(
+                QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(fit_curve[i - 1])),
+                QtCore.QPointF(scale_x(x_axis[i]), scale_y(fit_curve[i])),
+            )
+
+        painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
+        painter.drawText(margin, margin - 6, "Line profile (cyan) and Gaussian fit (orange)")
+        painter.end()
+        self.line_plot_label.setPixmap(QtGui.QPixmap.fromImage(img))
+
     def _prepare_display_image(self, payload: FramePayload) -> Image.Image:
         img = payload.pil_image.copy()
         if self._force_grayscale and img.mode != "L":
             img = img.convert("L")
         if self._gauss_fit:
             img = self._draw_gaussian_contour(img, self._gauss_fit)
+        if len(self._line_points) == 2:
+            img = self._draw_line_segment(img, self._line_points, color=(255, 215, 0))
         return img
 
     def _draw_gaussian_contour(self, image: Image.Image, fit: dict) -> Image.Image:
@@ -1025,6 +1087,16 @@ class CameraApp(QtWidgets.QMainWindow):
         if label_text:
             text_pos = (int(mu_x + rx + 4), int(mu_y - ry - 12))
             draw.text(text_pos, label_text, fill=(0, 255, 0))
+        return image
+
+    @staticmethod
+    def _draw_line_segment(image: Image.Image, points: list[tuple[int, int]], color=(255, 215, 0)):
+        if len(points) != 2:
+            return image
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        draw = ImageDraw.Draw(image)
+        draw.line(points, fill=color, width=2)
         return image
 
     def compute_gaussian_fit(self):
@@ -1120,6 +1192,66 @@ class CameraApp(QtWidgets.QMainWindow):
             f"angle {angle_deg_px:.1f} deg; peak {peak:.1f}, bg {baseline:.1f}"
         )
         self.gauss_result_label.setText(text)
+        self._refresh_image_view()
+
+    def _compute_line_fit(self, p1: tuple[int, int], p2: tuple[int, int]):
+        if not self.last_payload:
+            return
+        self.line_fit_status.setText("Line fit: computing...")
+        data = self.last_payload.np_image
+        if data.ndim == 3:
+            data = np.mean(data, axis=2)
+        x1, y1 = p1
+        x2, y2 = p2
+        dx = x2 - x1
+        dy = y2 - y1
+        length_px = float(np.hypot(dx, dy))
+        if length_px < 1e-6:
+            self.line_fit_status.setText("Line fit failed: points are identical.")
+            return
+        num = max(int(np.hypot(dx, dy)), 20)
+        xs = np.linspace(x1, x2, num)
+        ys = np.linspace(y1, y2, num)
+
+        def _sample_point(ix, iy):
+            if ix < 0 or iy < 0 or ix >= data.shape[1] - 1 or iy >= data.shape[0] - 1:
+                ix = min(max(ix, 0), data.shape[1] - 1)
+                iy = min(max(iy, 0), data.shape[0] - 1)
+                return float(data[int(iy), int(ix)])
+            x0 = int(np.floor(ix))
+            y0 = int(np.floor(iy))
+            dx_f = ix - x0
+            dy_f = iy - y0
+            v00 = data[y0, x0]
+            v10 = data[y0, x0 + 1]
+            v01 = data[y0 + 1, x0]
+            v11 = data[y0 + 1, x0 + 1]
+            top = v00 * (1 - dx_f) + v10 * dx_f
+            bottom = v01 * (1 - dx_f) + v11 * dx_f
+            return float(top * (1 - dy_f) + bottom * dy_f)
+
+        profile = np.array([_sample_point(ix, iy) for ix, iy in zip(xs, ys)], dtype=np.float64)
+        baseline = float(np.percentile(profile, 10.0))
+        weights = np.clip(profile - baseline, 0.0, None)
+        if weights.sum() <= 0:
+            self.line_fit_status.setText("Line fit failed: no signal above baseline.")
+            return
+        mu = float(np.sum(weights * np.arange(num)) / weights.sum())
+        var = float(np.sum(weights * (np.arange(num) - mu) ** 2) / weights.sum())
+        sigma = float(np.sqrt(max(var, 1e-9)))
+        amplitude = float(profile.max() - baseline)
+        fit_curve = baseline + amplitude * np.exp(-0.5 * ((np.arange(num) - mu) / sigma) ** 2)
+
+        px_axis = np.linspace(0, length_px, num)
+        self._line_profile = (px_axis, profile)
+        self._line_fit = {"baseline": baseline, "amplitude": amplitude, "mu": mu, "sigma": sigma, "length_px": length_px}
+        self._update_line_plot(px_axis, profile, fit_curve)
+
+        fwhm = 2.3548 * sigma * (length_px / max(num - 1, 1))
+        mu_pos_px = (mu / max(num - 1, 1)) * length_px
+        self.line_fit_status.setText(
+            f"Line fit OK: mu={mu_pos_px:.2f}px, sigma={sigma*(length_px/max(num-1,1)):.2f}px, FWHM={fwhm:.2f}px"
+        )
         self._refresh_image_view()
 
     def eventFilter(self, obj, event):
@@ -1282,6 +1414,18 @@ class CameraApp(QtWidgets.QMainWindow):
         if vbar:
             vbar.setValue(0)
 
+    def start_line_fit_selection(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "No image", "Capture or load an image first.")
+            return
+        self._line_select_mode = True
+        self._line_points = []
+        self._line_profile = None
+        self._line_fit = None
+        self.line_fit_status.setText("Line fit: click first point...")
+        self.line_plot_label.clear()
+        self._refresh_image_view()
+
     def on_mouse_move(self, x: int, y: int):
         if not self.last_payload:
             self.coord_label.setText("x: -, y: -, val: -")
@@ -1385,6 +1529,17 @@ class CameraApp(QtWidgets.QMainWindow):
         h, w = img.shape[:2]
         src_x = int(x / scale)
         src_y = int(y / scale)
+        if self._line_select_mode:
+            if 0 <= src_x < w and 0 <= src_y < h:
+                self._line_points.append((src_x, src_y))
+                if len(self._line_points) == 1:
+                    self.line_fit_status.setText("Line fit: click second point...")
+                elif len(self._line_points) >= 2:
+                    self._line_points = self._line_points[:2]
+                    self._line_select_mode = False
+                    self._compute_line_fit(self._line_points[0], self._line_points[1])
+                    return
+            return
         if 0 <= src_x < w and 0 <= src_y < h:
             gray = img
             if img.ndim == 3:
