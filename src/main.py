@@ -311,6 +311,11 @@ class CameraApp(QtWidgets.QMainWindow):
         self._line_points: list[tuple[int, int]] = []
         self._line_profile = None
         self._line_fit = None
+        self._line_edit_mode = False
+        self._line_dragging = False
+        self._line_drag_mode: Optional[str] = None
+        self._axis_lines: list[tuple[tuple[int, int], tuple[int, int], QtGui.QColor]] = []
+        self._axis_fit_results = {}
 
         self.setWindowTitle("Live View - No camera")
         self._build_ui()
@@ -440,6 +445,14 @@ class CameraApp(QtWidgets.QMainWindow):
         self.line_fit_btn = QtWidgets.QPushButton("2-Point Line Fit")
         self.line_fit_btn.clicked.connect(self.start_line_fit_selection)
         btn_row.addWidget(self.line_fit_btn)
+        self.run_line_fit_btn = QtWidgets.QPushButton("Run Line Fit")
+        self.run_line_fit_btn.clicked.connect(self.run_line_fit)
+        self.run_line_fit_btn.setEnabled(False)
+        btn_row.addWidget(self.run_line_fit_btn)
+        self.run_360_btn = QtWidgets.QPushButton("Run 360 Fit")
+        self.run_360_btn.clicked.connect(self.run_360_fit)
+        self.run_360_btn.setEnabled(False)
+        btn_row.addWidget(self.run_360_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
@@ -455,6 +468,20 @@ class CameraApp(QtWidgets.QMainWindow):
         self.line_plot_label.setMinimumHeight(180)
         self.line_plot_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.line_plot_label)
+
+        self.axis_fit_status = QtWidgets.QLabel("360 fit: not computed.")
+        self.axis_fit_status.setWordWrap(True)
+        layout.addWidget(self.axis_fit_status)
+
+        self.axis_plot_h = QtWidgets.QLabel()
+        self.axis_plot_h.setMinimumHeight(140)
+        self.axis_plot_h.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.axis_plot_h)
+
+        self.axis_plot_v = QtWidgets.QLabel()
+        self.axis_plot_v.setMinimumHeight(140)
+        self.axis_plot_v.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.axis_plot_v)
 
         window.hide()
         return window
@@ -1003,7 +1030,7 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.end()
         return QtGui.QPixmap.fromImage(image)
 
-    def _update_line_plot(self, x_axis: np.ndarray, profile: np.ndarray, fit_curve: np.ndarray):
+    def _update_line_plot(self, x_axis: np.ndarray, profile: np.ndarray, fit_curve: np.ndarray, length_mm: float):
         width = 540
         height = 240
         margin = 36
@@ -1044,8 +1071,213 @@ class CameraApp(QtWidgets.QMainWindow):
 
         painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
         painter.drawText(margin, margin - 6, "Line profile (cyan) and Gaussian fit (orange)")
+        painter.drawText(
+            width // 2 - 60,
+            height - 6,
+            f"Distance: 0–{x_axis[-1]:.1f}px ({max(length_mm,0):.3f}mm)",
+        )
+        painter.save()
+        painter.translate(12, height // 2 + 40)
+        painter.rotate(-90)
+        painter.drawText(0, 0, "Intensity (gray level)")
+        painter.restore()
         painter.end()
         self.line_plot_label.setPixmap(QtGui.QPixmap.fromImage(img))
+
+    def _update_axis_plot(self, target: QtWidgets.QLabel, title: str, x_axis: np.ndarray, profile: np.ndarray, fit_curve: np.ndarray, length_mm: float):
+        width = 420
+        height = 160
+        margin = 32
+        if x_axis.size == 0:
+            target.clear()
+            return
+        y_min = float(min(np.min(profile), np.min(fit_curve)))
+        y_max = float(max(np.max(profile), np.max(fit_curve)))
+        if y_max - y_min < 1e-6:
+            y_max = y_min + 1.0
+        def scale_x(x):
+            return margin + (x - x_axis[0]) / max(1e-9, x_axis[-1] - x_axis[0]) * (width - 2 * margin)
+        def scale_y(y):
+            return height - margin - (y - y_min) / (y_max - y_min) * (height - 2 * margin)
+
+        img = QtGui.QImage(width, height, QtGui.QImage.Format.Format_ARGB32)
+        img.fill(QtGui.QColor(12, 12, 12, 255))
+        painter = QtGui.QPainter(img)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(QtGui.QPen(QtGui.QColor(70, 70, 70), 1))
+        painter.drawRect(margin, margin, width - 2 * margin, height - 2 * margin)
+
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255), 2))
+        for i in range(1, len(x_axis)):
+            painter.drawLine(
+                QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(profile[i - 1])),
+                QtCore.QPointF(scale_x(x_axis[i]), scale_y(profile[i])),
+            )
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 150, 0), 2))
+        for i in range(1, len(x_axis)):
+            painter.drawLine(
+                QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(fit_curve[i - 1])),
+                QtCore.QPointF(scale_x(x_axis[i]), scale_y(fit_curve[i])),
+            )
+        painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
+        painter.drawText(margin, margin - 6, title)
+        painter.drawText(
+            width // 2 - 70,
+            height - 6,
+            f"0–{x_axis[-1]:.1f}px ({max(length_mm,0):.3f}mm)",
+        )
+        painter.save()
+        painter.translate(12, height // 2 + 28)
+        painter.rotate(-90)
+        painter.drawText(0, 0, "Intensity (gray level)")
+        painter.restore()
+        painter.end()
+        target.setPixmap(QtGui.QPixmap.fromImage(img))
+
+    def _enter_line_edit_mode(self):
+        self._line_select_mode = False
+        self._line_edit_mode = True
+        self._line_profile = None
+        self._line_fit = None
+        self.run_line_fit_btn.setEnabled(True)
+        self.run_360_btn.setEnabled(True)
+        self._sync_panning_enabled()
+        self.line_fit_status.setText("Line fit: drag endpoints or line, then press Run Line Fit.")
+        self.line_plot_label.clear()
+        self._refresh_image_view()
+
+    def _clamp_point(self, x: float, y: float) -> tuple[int, int]:
+        h = self.last_payload.np_image.shape[0] if self.last_payload else 0
+        w = self.last_payload.np_image.shape[1] if self.last_payload else 0
+        return int(max(0, min(w - 1, x))), int(max(0, min(h - 1, y)))
+
+    def _screen_point_for_line(self, pt: tuple[int, int]) -> QtCore.QPointF:
+        scale = self._last_render_scale or 1.0
+        return QtCore.QPointF(pt[0] * scale, pt[1] * scale)
+
+    def _distance_to_segment(self, p: QtCore.QPointF, a: QtCore.QPointF, b: QtCore.QPointF) -> float:
+        ax, ay, bx, by = a.x(), a.y(), b.x(), b.y()
+        px, py = p.x(), p.y()
+        dx = bx - ax
+        dy = by - ay
+        if dx == 0 and dy == 0:
+            return float(np.hypot(px - ax, py - ay))
+        t = ((px - ax) * dx + (py - ay) * dy) / float(dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        proj_x = ax + t * dx
+        proj_y = ay + t * dy
+        return float(np.hypot(px - proj_x, py - proj_y))
+
+    def _start_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if len(self._line_points) != 2:
+            return False
+        pos = event.position()
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(pos.x() / scale, pos.y() / scale)
+        p1_screen = self._screen_point_for_line(self._line_points[0])
+        p2_screen = self._screen_point_for_line(self._line_points[1])
+        hit_radius = 12.0
+        dist_p1 = float(np.hypot(pos.x() - p1_screen.x(), pos.y() - p1_screen.y()))
+        dist_p2 = float(np.hypot(pos.x() - p2_screen.x(), pos.y() - p2_screen.y()))
+        mode = None
+        if dist_p1 <= hit_radius:
+            mode = "p1"
+        elif dist_p2 <= hit_radius:
+            mode = "p2"
+        else:
+            dist_seg = self._distance_to_segment(pos, p1_screen, p2_screen)
+            if dist_seg <= hit_radius:
+                mode = "move"
+        if mode:
+            self._line_dragging = True
+            self._line_drag_mode = mode
+            self._line_drag_start = p_img
+            self._line_profile = None
+            self._line_fit = None
+            self.line_plot_label.clear()
+            self.line_fit_status.setText("Line fit: adjusting... press Run Line Fit.")
+            return True
+        return False
+
+    def _update_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._line_dragging or self._line_drag_mode is None:
+            return False
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(event.position().x() / scale, event.position().y() / scale)
+        dx = p_img.x() - self._line_drag_start.x()
+        dy = p_img.y() - self._line_drag_start.y()
+        if self._line_drag_mode == "p1":
+            new_p1 = self._clamp_point(self._line_points[0][0] + dx, self._line_points[0][1] + dy)
+            self._line_points[0] = new_p1
+        elif self._line_drag_mode == "p2":
+            new_p2 = self._clamp_point(self._line_points[1][0] + dx, self._line_points[1][1] + dy)
+            self._line_points[1] = new_p2
+        elif self._line_drag_mode == "move":
+            new_p1 = self._clamp_point(self._line_points[0][0] + dx, self._line_points[0][1] + dy)
+            new_p2 = self._clamp_point(self._line_points[1][0] + dx, self._line_points[1][1] + dy)
+            self._line_points[0] = new_p1
+            self._line_points[1] = new_p2
+        self._line_drag_start = p_img
+        self._refresh_image_view()
+        return True
+
+    def _finish_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._line_dragging:
+            return False
+        self._line_dragging = False
+        self._line_drag_mode = None
+        return True
+
+    def _sample_line_profile(self, p1: tuple[int, int], p2: tuple[int, int], min_samples: int = 20):
+        if not self.last_payload:
+            return None
+        data = self.last_payload.np_image
+        if data.ndim == 3:
+            data = np.mean(data, axis=2)
+        x1, y1 = p1
+        x2, y2 = p2
+        length_px = float(np.hypot(x2 - x1, y2 - y1))
+        num = max(int(length_px), min_samples)
+        if num <= 1:
+            return None
+        xs = np.linspace(x1, x2, num)
+        ys = np.linspace(y1, y2, num)
+
+        def _sample_point(ix, iy):
+            if ix < 0 or iy < 0 or ix >= data.shape[1] - 1 or iy >= data.shape[0] - 1:
+                ix = min(max(ix, 0), data.shape[1] - 1)
+                iy = min(max(iy, 0), data.shape[0] - 1)
+                return float(data[int(iy), int(ix)])
+            x0 = int(np.floor(ix))
+            y0 = int(np.floor(iy))
+            dx_f = ix - x0
+            dy_f = iy - y0
+            v00 = data[y0, x0]
+            v10 = data[y0, x0 + 1]
+            v01 = data[y0 + 1, x0]
+            v11 = data[y0 + 1, x0 + 1]
+            top = v00 * (1 - dx_f) + v10 * dx_f
+            bottom = v01 * (1 - dx_f) + v11 * dx_f
+            return float(top * (1 - dy_f) + bottom * dy_f)
+
+        profile = np.array([_sample_point(ix, iy) for ix, iy in zip(xs, ys)], dtype=np.float64)
+        length_mm = float(np.hypot((x2 - x1) * self.mm_per_px_x, (y2 - y1) * self.mm_per_px_y))
+        px_axis = np.linspace(0, length_px, num)
+        return px_axis, profile, length_px, length_mm
+
+    def _fit_1d_gaussian(self, profile: np.ndarray):
+        baseline = float(np.percentile(profile, 10.0))
+        weights = np.clip(profile - baseline, 0.0, None)
+        if weights.sum() <= 0:
+            return None
+        num = profile.size
+        mu = float(np.sum(weights * np.arange(num)) / weights.sum())
+        var = float(np.sum(weights * (np.arange(num) - mu) ** 2) / weights.sum())
+        sigma = float(np.sqrt(max(var, 1e-9)))
+        amplitude = float(profile.max() - baseline)
+        fit_curve = baseline + amplitude * np.exp(-0.5 * ((np.arange(num) - mu) / sigma) ** 2)
+        return baseline, amplitude, mu, sigma, fit_curve
+
 
     def _prepare_display_image(self, payload: FramePayload) -> Image.Image:
         img = payload.pil_image.copy()
@@ -1055,6 +1287,10 @@ class CameraApp(QtWidgets.QMainWindow):
             img = self._draw_gaussian_contour(img, self._gauss_fit)
         if len(self._line_points) == 2:
             img = self._draw_line_segment(img, self._line_points, color=(255, 215, 0))
+        if self._axis_lines:
+            for seg in self._axis_lines:
+                p1, p2, color = seg
+                img = self._draw_line_segment(img, [p1, p2], color=(color.red(), color.green(), color.blue()))
         return img
 
     def _draw_gaussian_contour(self, image: Image.Image, fit: dict) -> Image.Image:
@@ -1097,6 +1333,10 @@ class CameraApp(QtWidgets.QMainWindow):
             image = image.convert("RGB")
         draw = ImageDraw.Draw(image)
         draw.line(points, fill=color, width=2)
+        r = 5
+        for pt in points:
+            x, y = pt
+            draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=2)
         return image
 
     def compute_gaussian_fit(self):
@@ -1198,59 +1438,162 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self.last_payload:
             return
         self.line_fit_status.setText("Line fit: computing...")
+        sampled = self._sample_line_profile(p1, p2)
+        if sampled is None:
+            self.line_fit_status.setText("Line fit failed: points are identical.")
+            return
+        px_axis, profile, length_px, length_mm = sampled
+        fit = self._fit_1d_gaussian(profile)
+        if fit is None:
+            self.line_fit_status.setText("Line fit failed: no signal above baseline.")
+            return
+        baseline, amplitude, mu, sigma, fit_curve = fit
+
+        self._line_profile = (px_axis, profile)
+        self._line_fit = {
+            "baseline": baseline,
+            "amplitude": amplitude,
+            "mu": mu,
+            "sigma": sigma,
+            "length_px": length_px,
+            "length_mm": length_mm,
+        }
+        self._update_line_plot(px_axis, profile, fit_curve, length_mm)
+
+        px_step = length_px / max(len(px_axis) - 1, 1)
+        mm_step = length_mm / max(len(px_axis) - 1, 1)
+        sigma_px = sigma * px_step
+        sigma_mm = sigma * mm_step
+        fwhm_px = 2.3548 * sigma_px
+        fwhm_mm = 2.3548 * sigma_mm
+        w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
+        w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
+        mu_pos_px = (mu / max(len(px_axis) - 1, 1)) * length_px
+        mu_pos_mm = (mu / max(len(px_axis) - 1, 1)) * length_mm
+        self.line_fit_status.setText(
+            "Line fit OK: "
+            f"mu={mu_pos_px:.2f}px ({mu_pos_mm:.3f}mm), "
+            f"sigma={sigma_px:.2f}px ({sigma_mm:.3f}mm), "
+            f"FWHM={fwhm_px:.2f}px ({fwhm_mm:.3f}mm), "
+            f"1/e^2={w1e2_px:.2f}px ({w1e2_mm:.3f}mm)"
+        )
+        self._refresh_image_view()
+
+    def run_line_fit(self):
+        if len(self._line_points) != 2:
+            self.line_fit_status.setText("Line fit: select two points first.")
+            return
+        self._compute_line_fit(self._line_points[0], self._line_points[1])
+
+    def _moment_center_and_cov(self, data: np.ndarray):
+        baseline = float(np.percentile(data, 10.0))
+        weights = np.clip(data.astype(np.float64) - baseline, 0.0, None)
+        if weights.sum() <= 0:
+            return None
+        h, w = data.shape
+        yy, xx = np.indices((h, w))
+        mu_x = float(np.sum(weights * xx) / weights.sum())
+        mu_y = float(np.sum(weights * yy) / weights.sum())
+        dx = xx - mu_x
+        dy = yy - mu_y
+        cov_xx = float(np.sum(weights * dx * dx) / weights.sum())
+        cov_yy = float(np.sum(weights * dy * dy) / weights.sum())
+        cov_xy = float(np.sum(weights * dx * dy) / weights.sum())
+        return mu_x, mu_y, cov_xx, cov_yy, cov_xy
+
+    def _compute_axis_line_fit(self, name: str, p1: tuple[int, int], p2: tuple[int, int]) -> Optional[dict]:
+        sampled = self._sample_line_profile(p1, p2)
+        if sampled is None:
+            return None
+        px_axis, profile, length_px, length_mm = sampled
+        fit = self._fit_1d_gaussian(profile)
+        if fit is None:
+            return None
+        baseline, amplitude, mu, sigma, fit_curve = fit
+        px_step = length_px / max(len(px_axis) - 1, 1)
+        mm_step = length_mm / max(len(px_axis) - 1, 1)
+        sigma_px = sigma * px_step
+        sigma_mm = sigma * mm_step
+        fwhm_px = 2.3548 * sigma_px
+        fwhm_mm = 2.3548 * sigma_mm
+        w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
+        w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
+        mu_pos_px = (mu / max(len(px_axis) - 1, 1)) * length_px
+        mu_pos_mm = (mu / max(len(px_axis) - 1, 1)) * length_mm
+        return {
+            "name": name,
+            "px_axis": px_axis,
+            "profile": profile,
+            "fit_curve": fit_curve,
+            "length_px": length_px,
+            "length_mm": length_mm,
+            "sigma_px": sigma_px,
+            "sigma_mm": sigma_mm,
+            "fwhm_px": fwhm_px,
+            "fwhm_mm": fwhm_mm,
+            "w1e2_px": w1e2_px,
+            "w1e2_mm": w1e2_mm,
+            "mu_px": mu_pos_px,
+            "mu_mm": mu_pos_mm,
+        }
+
+    def run_360_fit(self):
+        if not self.last_payload:
+            self.axis_fit_status.setText("360 fit: no image.")
+            return
+        if len(self._line_points) != 2:
+            self.axis_fit_status.setText("360 fit: select a line first.")
+            return
         data = self.last_payload.np_image
         if data.ndim == 3:
             data = np.mean(data, axis=2)
-        x1, y1 = p1
-        x2, y2 = p2
-        dx = x2 - x1
-        dy = y2 - y1
-        length_px = float(np.hypot(dx, dy))
-        if length_px < 1e-6:
-            self.line_fit_status.setText("Line fit failed: points are identical.")
+        center_stats = self._moment_center_and_cov(data)
+        if center_stats is None:
+            self.axis_fit_status.setText("360 fit failed: no signal.")
             return
-        num = max(int(np.hypot(dx, dy)), 20)
-        xs = np.linspace(x1, x2, num)
-        ys = np.linspace(y1, y2, num)
+        mu_x, mu_y, _, _, _ = center_stats
+        h, w = data.shape
+        cx = float(np.clip(mu_x, 0, w - 1))
+        cy = float(np.clip(mu_y, 0, h - 1))
 
-        def _sample_point(ix, iy):
-            if ix < 0 or iy < 0 or ix >= data.shape[1] - 1 or iy >= data.shape[0] - 1:
-                ix = min(max(ix, 0), data.shape[1] - 1)
-                iy = min(max(iy, 0), data.shape[0] - 1)
-                return float(data[int(iy), int(ix)])
-            x0 = int(np.floor(ix))
-            y0 = int(np.floor(iy))
-            dx_f = ix - x0
-            dy_f = iy - y0
-            v00 = data[y0, x0]
-            v10 = data[y0, x0 + 1]
-            v01 = data[y0 + 1, x0]
-            v11 = data[y0 + 1, x0 + 1]
-            top = v00 * (1 - dx_f) + v10 * dx_f
-            bottom = v01 * (1 - dx_f) + v11 * dx_f
-            return float(top * (1 - dy_f) + bottom * dy_f)
+        horiz_p1 = (0, int(round(cy)))
+        horiz_p2 = (w - 1, int(round(cy)))
+        vert_p1 = (int(round(cx)), 0)
+        vert_p2 = (int(round(cx)), h - 1)
 
-        profile = np.array([_sample_point(ix, iy) for ix, iy in zip(xs, ys)], dtype=np.float64)
-        baseline = float(np.percentile(profile, 10.0))
-        weights = np.clip(profile - baseline, 0.0, None)
-        if weights.sum() <= 0:
-            self.line_fit_status.setText("Line fit failed: no signal above baseline.")
+        fit_h = self._compute_axis_line_fit("Horizontal", horiz_p1, horiz_p2)
+        fit_v = self._compute_axis_line_fit("Vertical", vert_p1, vert_p2)
+        if not fit_h or not fit_v:
+            self.axis_fit_status.setText("360 fit failed: could not fit axes.")
             return
-        mu = float(np.sum(weights * np.arange(num)) / weights.sum())
-        var = float(np.sum(weights * (np.arange(num) - mu) ** 2) / weights.sum())
-        sigma = float(np.sqrt(max(var, 1e-9)))
-        amplitude = float(profile.max() - baseline)
-        fit_curve = baseline + amplitude * np.exp(-0.5 * ((np.arange(num) - mu) / sigma) ** 2)
 
-        px_axis = np.linspace(0, length_px, num)
-        self._line_profile = (px_axis, profile)
-        self._line_fit = {"baseline": baseline, "amplitude": amplitude, "mu": mu, "sigma": sigma, "length_px": length_px}
-        self._update_line_plot(px_axis, profile, fit_curve)
+        self._axis_lines = [
+            (horiz_p1, horiz_p2, QtGui.QColor(0, 200, 255)),
+            (vert_p1, vert_p2, QtGui.QColor(255, 120, 0)),
+        ]
+        self._axis_fit_results = {"H": fit_h, "V": fit_v}
 
-        fwhm = 2.3548 * sigma * (length_px / max(num - 1, 1))
-        mu_pos_px = (mu / max(num - 1, 1)) * length_px
-        self.line_fit_status.setText(
-            f"Line fit OK: mu={mu_pos_px:.2f}px, sigma={sigma*(length_px/max(num-1,1)):.2f}px, FWHM={fwhm:.2f}px"
+        self._update_axis_plot(
+            self.axis_plot_h,
+            "Horizontal profile (cyan) + fit (orange)",
+            fit_h["px_axis"],
+            fit_h["profile"],
+            fit_h["fit_curve"],
+            fit_h["length_mm"],
+        )
+        self._update_axis_plot(
+            self.axis_plot_v,
+            "Vertical profile (cyan) + fit (orange)",
+            fit_v["px_axis"],
+            fit_v["profile"],
+            fit_v["fit_curve"],
+            fit_v["length_mm"],
+        )
+
+        self.axis_fit_status.setText(
+            "360 fit OK: "
+            f"H FWHM={fit_h['fwhm_px']:.2f}px ({fit_h['fwhm_mm']:.3f}mm); "
+            f"V FWHM={fit_v['fwhm_px']:.2f}px ({fit_v['fwhm_mm']:.3f}mm)"
         )
         self._refresh_image_view()
 
@@ -1273,6 +1616,16 @@ class CameraApp(QtWidgets.QMainWindow):
         ):
             if self._handle_wheel_zoom(event, obj):
                 return True
+        elif obj is getattr(self, "image_label", None) and self._line_edit_mode:
+            if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                if self._start_line_drag(event):
+                    return True
+            elif event.type() == QtCore.QEvent.Type.MouseMove:
+                if self._update_line_drag(event):
+                    return True
+            elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                if self._finish_line_drag(event):
+                    return True
         return super().eventFilter(obj, event)
 
     @staticmethod
@@ -1402,7 +1755,7 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _sync_panning_enabled(self):
         if getattr(self, "image_label", None):
-            self.image_label.set_panning_enabled(not self._fit_to_window)
+            self.image_label.set_panning_enabled(not self._fit_to_window and not self._line_edit_mode)
 
     def _reset_pan(self):
         if not getattr(self, "scroll_area", None):
@@ -1419,11 +1772,19 @@ class CameraApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "No image", "Capture or load an image first.")
             return
         self._line_select_mode = True
+        self._line_edit_mode = False
         self._line_points = []
         self._line_profile = None
         self._line_fit = None
+        self._axis_lines = []
+        self._axis_fit_results = {}
         self.line_fit_status.setText("Line fit: click first point...")
         self.line_plot_label.clear()
+        self.run_line_fit_btn.setEnabled(False)
+        self.run_360_btn.setEnabled(False)
+        self.axis_fit_status.setText("360 fit: not computed.")
+        self.axis_plot_h.clear()
+        self.axis_plot_v.clear()
         self._refresh_image_view()
 
     def on_mouse_move(self, x: int, y: int):
@@ -1524,6 +1885,8 @@ class CameraApp(QtWidgets.QMainWindow):
     def on_mouse_click(self, x: int, y: int):
         if not self.last_payload:
             return
+        if self._line_edit_mode and not self._line_select_mode:
+            return
         scale = self._last_render_scale if self._last_render_scale else 1.0
         img = self.last_payload.np_image
         h, w = img.shape[:2]
@@ -1536,8 +1899,7 @@ class CameraApp(QtWidgets.QMainWindow):
                     self.line_fit_status.setText("Line fit: click second point...")
                 elif len(self._line_points) >= 2:
                     self._line_points = self._line_points[:2]
-                    self._line_select_mode = False
-                    self._compute_line_fit(self._line_points[0], self._line_points[1])
+                    self._enter_line_edit_mode()
                     return
             return
         if 0 <= src_x < w and 0 <= src_y < h:
