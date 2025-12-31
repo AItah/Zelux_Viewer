@@ -3,3 +3,4 @@ PyQt6
 pillow
 tifffile
 numpy
+pyinstaller

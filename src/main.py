@@ -44,7 +44,23 @@ def _add_repo_dll_path():
             pass
 
 
+def _add_bundle_dll_path():
+    """When frozen by PyInstaller, also look for bundled DLLs in dlls/{arch}_lib next to the exe."""
+    if not hasattr(sys, "_MEIPASS"):
+        return
+    is_64bits = sys.maxsize > 2**32
+    arch_dir = "64_lib" if is_64bits else "32_lib"
+    candidate = os.path.join(sys._MEIPASS, "dlls", arch_dir)
+    if os.path.isdir(candidate):
+        os.environ["PATH"] = candidate + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(candidate)
+        except AttributeError:
+            pass
+
+
 _add_repo_dll_path()
+_add_bundle_dll_path()
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -563,8 +579,8 @@ class CameraApp(QtWidgets.QMainWindow):
             ("Save Image", self.save_image),
             ("Load Image", self.load_image),
             ("Clear Cross", self.clear_cross),
-            ("Zoom In", self.zoom_in),
-            ("Zoom Out", self.zoom_out),
+            # ("Zoom In", self.zoom_in),
+            # ("Zoom Out", self.zoom_out),
             ("Fit", self.fit_to_window),
         ]
         for text, handler in buttons:
@@ -1505,6 +1521,7 @@ class CameraApp(QtWidgets.QMainWindow):
         w1e2_minor_mm = np.sqrt(2.0) * sigma_minor_mm
 
         peak = baseline + float(weights.max())
+        waist_ratio = (w1e2_major_mm / w1e2_minor_mm) if w1e2_minor_mm else 0.0
 
         self._gauss_fit = {
             "mu_x": mu_x,
@@ -1516,7 +1533,8 @@ class CameraApp(QtWidgets.QMainWindow):
             "w1e2_major_mm": w1e2_major_mm,
             "w1e2_minor_mm": w1e2_minor_mm,
             "angle_deg": angle_deg_px,
-            "label_text": f"{2*w1e2_major:.2f}px ({2*w1e2_major_mm:.3f}mm) x {2*w1e2_minor:.2f}px ({2*w1e2_minor_mm:.3f}mm)",
+            "waist_ratio": waist_ratio,
+            "label_text": f"{2*w1e2_major:.2f}px ({2*w1e2_major_mm:.3f}mm) x {2*w1e2_minor:.2f}px ({2*w1e2_minor_mm:.3f}mm) | ratio {waist_ratio:.3f}",
         }
 
         text = (
@@ -1669,6 +1687,8 @@ class CameraApp(QtWidgets.QMainWindow):
         self._axis_fit_results = {"H": fit_h, "V": fit_v}
         self._axis_center_px = (cx, cy)
         self.cross_pos = (int(round(cx)), int(round(cy)))
+        # clear manual line overlay after 360 fit
+        self._line_points = []
 
         self._update_axis_plot(
             self.axis_plot_h,
@@ -1705,7 +1725,8 @@ class CameraApp(QtWidgets.QMainWindow):
             "w1e2_major_mm": fit_h["w1e2_mm"],
             "w1e2_minor_mm": fit_v["w1e2_mm"],
             "angle_deg": 0.0,
-            "label_text": f"{fit_h['w1e2_px']*2:.2f}px ({fit_h['w1e2_mm']*2:.3f}mm) x {fit_v['w1e2_px']*2:.2f}px ({fit_v['w1e2_mm']*2:.3f}mm)",
+            "waist_ratio": (fit_h["w1e2_mm"] / fit_v["w1e2_mm"]) if fit_v["w1e2_mm"] else 0.0,
+            "label_text": f"{fit_h['w1e2_px']*2:.2f}px ({fit_h['w1e2_mm']*2:.3f}mm) x {fit_v['w1e2_px']*2:.2f}px ({fit_v['w1e2_mm']*2:.3f}mm) | ratio {(fit_h['w1e2_mm'] / fit_v['w1e2_mm']) if fit_v['w1e2_mm'] else 0.0:.3f}",
         }
         self._refresh_image_view()
         self._line_edit_mode = False
