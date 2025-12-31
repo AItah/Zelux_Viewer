@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from PyQt6 import QtCore, QtGui, QtWidgets
 from thorlabs_tsi_sdk.tl_camera import Frame, TLCamera, TLCameraSDK
 from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
@@ -1339,7 +1339,18 @@ class CameraApp(QtWidgets.QMainWindow):
             draw.line(points, fill=(0, 255, 0), width=2)
         if label_text:
             text_pos = (int(mu_x + rx + 4), int(mu_y - ry - 12))
-            draw.text(text_pos, label_text, fill=(0, 255, 0))
+            font = self._get_overlay_font(18)
+            # Clamp text so it stays inside the image
+            try:
+                bbox = draw.textbbox((0, 0), label_text, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            except Exception:
+                text_w, text_h = font.getsize(label_text) if font else (0, 0)
+            img_w, img_h = image.size
+            x = min(max(0, text_pos[0]), max(0, img_w - text_w - 4))
+            y = min(max(0, text_pos[1]), max(0, img_h - text_h - 4))
+            draw.text((x, y), label_text, fill=(0, 255, 0), font=font)
         return image
 
     @staticmethod
@@ -1355,6 +1366,19 @@ class CameraApp(QtWidgets.QMainWindow):
             x, y = pt
             draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=2)
         return image
+
+    def _get_overlay_font(self, size: int = 18):
+        if not hasattr(self, "_cached_overlay_font") or self._cached_overlay_font is None:
+            font = None
+            try:
+                font = ImageFont.truetype("arial.ttf", size)
+            except Exception:
+                try:
+                    font = ImageFont.truetype("DejaVuSans.ttf", size)
+                except Exception:
+                    font = ImageFont.load_default()
+            self._cached_overlay_font = font
+        return self._cached_overlay_font
 
     def compute_gaussian_fit(self):
         if not self.last_payload:
