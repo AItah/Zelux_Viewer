@@ -21,11 +21,26 @@ import queue
 import sys
 import threading
 import time
+import csv
 from dataclasses import dataclass
 from typing import Optional
+from datetime import datetime
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+try:
+    import cv2  # Optional: used for generic DirectShow cameras
+
+    _HAVE_OPENCV = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAVE_OPENCV = False
+try:
+    from pypylon import pylon  # Optional: Basler cameras via Pylon
+
+    _HAVE_PYLON = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAVE_PYLON = False
+from beam_profile_fitting import gaussian_or_lorentzian_aic
 from PyQt6 import QtCore, QtGui, QtWidgets
 from thorlabs_tsi_sdk.tl_camera import Frame, TLCamera, TLCameraSDK
 from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
@@ -300,16 +315,278 @@ class OverlayPanel(QtWidgets.QFrame):
         )
 
 
+class GenericVideoThread(threading.Thread):
+    """OpenCV-based capture for generic DirectShow cameras."""
+
+    def __init__(self, index: int):
+        super().__init__(daemon=True)
+        self.index = index
+        self._stop_event = threading.Event()
+        self._queue: queue.Queue[FramePayload] = queue.Queue(maxsize=2)
+        self._cap = None
+        self._lock = threading.Lock()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def get_queue(self):
+        return self._queue
+
+    def set_exposure_us(self, value_us: int):
+        """Attempt to set exposure in seconds if supported."""
+        if not self._cap:
+            return False
+        with self._lock:
+            try:
+                return bool(self._cap.set(cv2.CAP_PROP_EXPOSURE, float(value_us) / 1e6))
+            except Exception:
+                return False
+
+    def set_gain(self, value):
+        """Attempt to set gain if supported."""
+        if not self._cap:
+            return False
+        with self._lock:
+            try:
+                return bool(self._cap.set(cv2.CAP_PROP_GAIN, float(value)))
+            except Exception:
+                return False
+
+    def get_props(self):
+        """Return (exposure_us, gain) if available, else (None, None)."""
+        if not self._cap:
+            return None, None
+        with self._lock:
+            try:
+                exp = self._cap.get(cv2.CAP_PROP_EXPOSURE)
+                gain = self._cap.get(cv2.CAP_PROP_GAIN)
+            except Exception:
+                return None, None
+        # Many drivers return negative/seconds; best effort to convert.
+        if exp is None:
+            exp_us = None
+        else:
+            try:
+                exp_us = int(exp * 1e6) if exp > 0 else None
+            except Exception:
+                exp_us = None
+        return exp_us, gain
+
+    def _open_capture(self):
+        if not _HAVE_OPENCV:
+            return False
+        self._cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+        if not self._cap.isOpened():
+            self._cap = None
+            return False
+        return True
+
+    def _read_frame(self):
+        if not self._cap:
+            return None
+        ok, frame = self._cap.read()
+        if not ok or frame is None:
+            return None
+        # frame is BGR uint8
+        np_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(np_image, mode="RGB")
+        return FramePayload(pil_image=pil_image, np_image=np_image, frame_count=0)
+
+    def run(self):
+        if not self._open_capture():
+            return
+        while not self._stop_event.is_set():
+            payload = self._read_frame()
+            if payload is None:
+                time.sleep(0.02)
+                continue
+            try:
+                self._queue.put_nowait(payload)
+            except queue.Full:
+                pass
+        if self._cap:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+
+
+class PylonVideoThread(threading.Thread):
+    """Pylon-based capture for Basler cameras."""
+
+    def __init__(self, device_info):
+        super().__init__(daemon=True)
+        self.device_info = device_info
+        self._stop_event = threading.Event()
+        self._queue: queue.Queue[FramePayload] = queue.Queue(maxsize=2)
+        self._camera = None
+        self._converter = None
+        self.frame_count = 0
+        self._lock = threading.Lock()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def get_queue(self):
+        return self._queue
+
+    def _with_camera(self, fn, default=None):
+        cam = self._camera
+        if cam is None:
+            return default
+        with self._lock:
+            try:
+                return fn(cam)
+            except Exception:
+                return default
+
+    def get_props(self):
+        """Return (exposure_us, gain_db or raw) if available."""
+        def _read(cam):
+            exp = None
+            gain = None
+            for name in ("ExposureTime", "ExposureTimeAbs"):
+                if hasattr(cam, name):
+                    try:
+                        exp = float(getattr(cam, name).GetValue())
+                        break
+                    except Exception:
+                        pass
+            for name in ("Gain", "GainRaw"):
+                if hasattr(cam, name):
+                    try:
+                        gain = float(getattr(cam, name).GetValue())
+                        break
+                    except Exception:
+                        pass
+            if exp is not None:
+                exp = float(exp)
+            return exp, gain
+        return self._with_camera(_read, (None, None))
+
+    def get_limits(self):
+        """Return exposure/gain (min,max) tuples when possible."""
+        def _limits(cam):
+            exp_min = 1.0
+            exp_max = 10_000_000.0
+            gain_min = 0.0
+            gain_max = 30.0
+            for name in ("ExposureTime", "ExposureTimeAbs"):
+                node = getattr(cam, name, None)
+                if node:
+                    try:
+                        exp_min = float(node.GetMin())
+                        exp_max = float(node.GetMax())
+                        break
+                    except Exception:
+                        pass
+            for name in ("Gain", "GainRaw"):
+                node = getattr(cam, name, None)
+                if node:
+                    try:
+                        gain_min = float(node.GetMin())
+                        gain_max = float(node.GetMax())
+                        break
+                    except Exception:
+                        pass
+            return (exp_min, exp_max), (gain_min, gain_max)
+        return self._with_camera(_limits, ((1.0, 10_000_000.0), (0.0, 30.0)))
+
+    def set_exposure_us(self, value: float) -> bool:
+        def _set(cam):
+            for name in ("ExposureTime", "ExposureTimeAbs"):
+                node = getattr(cam, name, None)
+                if node:
+                    try:
+                        node.SetValue(float(value))
+                        return True
+                    except Exception:
+                        pass
+            return False
+        return bool(self._with_camera(_set, False))
+
+    def set_gain(self, value: float) -> bool:
+        def _set(cam):
+            for name in ("Gain", "GainRaw"):
+                node = getattr(cam, name, None)
+                if node:
+                    try:
+                        node.SetValue(float(value))
+                        return True
+                    except Exception:
+                        pass
+            return False
+        return bool(self._with_camera(_set, False))
+
+    def _open_camera(self):
+        try:
+            self._camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateDevice(self.device_info))
+            self._camera.Open()
+            self._converter = pylon.ImageFormatConverter()
+            self._converter.OutputPixelFormat = pylon.PixelType_RGB8packed
+            self._converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+            return True
+        except Exception:
+            self._camera = None
+            self._converter = None
+            return False
+
+    def run(self):
+        if not self._open_camera():
+            return
+        try:
+            self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            while not self._stop_event.is_set() and self._camera.IsGrabbing():
+                grab = self._camera.RetrieveResult(50, pylon.TimeoutHandling_Return)
+                if not grab or not grab.GrabSucceeded():
+                    if grab:
+                        grab.Release()
+                    time.sleep(0.01)
+                    continue
+                try:
+                    converted = self._converter.Convert(grab)
+                    img_arr = converted.GetArray()
+                    if img_arr.ndim == 2:
+                        np_image = img_arr
+                        pil_image = Image.fromarray(np_image)
+                    else:
+                        np_image = img_arr
+                        pil_image = Image.fromarray(np_image, mode="RGB")
+                    self.frame_count += 1
+                    payload = FramePayload(pil_image=pil_image, np_image=np_image, frame_count=self.frame_count)
+                    try:
+                        self._queue.put_nowait(payload)
+                    except queue.Full:
+                        pass
+                finally:
+                    grab.Release()
+        finally:
+            try:
+                self._camera.StopGrabbing()
+            except Exception:
+                pass
+            try:
+                self._camera.Close()
+            except Exception:
+                pass
+
+
 class CameraApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         os.makedirs(DATA_DIR, exist_ok=True)
         self.sdk = TLCameraSDK()
         self.camera: Optional[TLCamera] = None
+        self._use_cv = False
+        self._use_pylon = False
+        self.cv_index: Optional[int] = None
+        self.pylon_device_info = None
 
         self.cross_pos = None
         self.last_payload: Optional[FramePayload] = None
         self.acq_thread: Optional[ImageAcquisitionThread] = None
+        self.cv_thread: Optional[GenericVideoThread] = None
+        self.pylon_thread: Optional[PylonVideoThread] = None
         self._live = False
         self._zoom = 1.0
         self._fit_to_window = True
@@ -322,6 +599,14 @@ class CameraApp(QtWidgets.QMainWindow):
         self._gauss_fit = None
         self._hist_window_positioned = False
         self._fit_window_positioned = False
+        self._calibration_window_positioned = False
+        self._calibration_axis: Optional[str] = None  # "x" or "y" while active
+        self._calibration_last_axis: Optional[str] = None  # remember last calibrated axis for overlay
+        self._calibration_points: list[tuple[int, int]] = []
+        self._calibration_dragging = False
+        self._calibration_drag_mode: Optional[str] = None
+        self._calibration_drag_start: Optional[QtCore.QPointF] = None
+        self._calibration_drag_start_points: list[tuple[int, int]] = []
         self._in_hist_update = False
         self._line_select_mode = False
         self._line_points: list[tuple[int, int]] = []
@@ -334,6 +619,8 @@ class CameraApp(QtWidgets.QMainWindow):
         self._axis_fit_results = {}
         self._axis_center_px: Optional[tuple[float, float]] = None
         self._settings = QtCore.QSettings("BaslerTool", "Viewer")
+        self._filtered_np_image: Optional[np.ndarray] = None
+        self._pending_sections: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
         self._restore_window_state(self, "main_window")
         self.setWindowTitle("Live View - No camera")
@@ -403,8 +690,18 @@ class CameraApp(QtWidgets.QMainWindow):
         self.fit_window = self._build_fit_window()
         self.fit_window.installEventFilter(self)
 
+        self.calibration_window = self._build_calibration_window()
+        self.calibration_window.installEventFilter(self)
+
         self._restore_window_state(self.hist_window, "hist_window")
         self._restore_window_state(self.fit_window, "fit_window")
+        calib_restored = self._restore_window_state(self.calibration_window, "calibration_window")
+        if calib_restored:
+            self._calibration_window_positioned = True
+        if getattr(self, "measure_checkbox", None) and self.calibration_window.isVisible():
+            self.measure_checkbox.blockSignals(True)
+            self.measure_checkbox.setChecked(True)
+            self.measure_checkbox.blockSignals(False)
 
         self._sync_panning_enabled()
 
@@ -462,6 +759,34 @@ class CameraApp(QtWidgets.QMainWindow):
         info_label.setStyleSheet("color: #ccc;")
         layout.addWidget(info_label)
 
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.addWidget(QtWidgets.QLabel("Profile filter:"))
+        self.filter_mode_combo = QtWidgets.QComboBox()
+        self.filter_mode_combo.addItems(["None", "Low-pass", "High-pass", "Band-pass"])
+        self.filter_mode_combo.currentTextChanged.connect(self._on_filter_changed)
+        filter_row.addWidget(self.filter_mode_combo)
+        self.filter_low_spin = QtWidgets.QDoubleSpinBox()
+        self.filter_low_spin.setRange(0.0, 0.5)
+        self.filter_low_spin.setDecimals(3)
+        self.filter_low_spin.setSingleStep(0.01)
+        self.filter_low_spin.setValue(0.01)
+        self.filter_low_spin.setSuffix(" xNyq")
+        self.filter_low_spin.valueChanged.connect(self._on_filter_changed)
+        filter_row.addWidget(QtWidgets.QLabel("Low cut"))
+        filter_row.addWidget(self.filter_low_spin)
+        self.filter_high_spin = QtWidgets.QDoubleSpinBox()
+        self.filter_high_spin.setRange(0.0, 0.5)
+        self.filter_high_spin.setDecimals(3)
+        self.filter_high_spin.setSingleStep(0.01)
+        self.filter_high_spin.setValue(0.25)
+        self.filter_high_spin.setSuffix(" xNyq")
+        self.filter_high_spin.valueChanged.connect(self._on_filter_changed)
+        filter_row.addWidget(QtWidgets.QLabel("High cut"))
+        filter_row.addWidget(self.filter_high_spin)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+        self._sync_filter_controls()
+
         btn_row = QtWidgets.QHBoxLayout()
         # self.gauss_btn = QtWidgets.QPushButton("Gaussian Fit @ Cross")
         # self.gauss_btn.clicked.connect(self.compute_gaussian_fit)
@@ -469,14 +794,13 @@ class CameraApp(QtWidgets.QMainWindow):
         self.line_fit_btn = QtWidgets.QPushButton("2-Point Line Fit")
         self.line_fit_btn.clicked.connect(self.start_line_fit_selection)
         btn_row.addWidget(self.line_fit_btn)
-        self.run_line_fit_btn = QtWidgets.QPushButton("Run Line Fit")
-        self.run_line_fit_btn.clicked.connect(self.run_line_fit)
-        self.run_line_fit_btn.setEnabled(False)
-        btn_row.addWidget(self.run_line_fit_btn)
-        self.run_360_btn = QtWidgets.QPushButton("Run 360 Fit")
-        self.run_360_btn.clicked.connect(self.run_360_fit)
-        self.run_360_btn.setEnabled(False)
-        btn_row.addWidget(self.run_360_btn)
+        self.run_scipy_btn = QtWidgets.QPushButton("SciPy Fit")
+        self.run_scipy_btn.clicked.connect(self.run_scipy_fit)
+        self.run_scipy_btn.setEnabled(True)
+        btn_row.addWidget(self.run_scipy_btn)
+        self.clear_fit_btn = QtWidgets.QPushButton("Clear Fits")
+        self.clear_fit_btn.clicked.connect(self.clear_fits)
+        btn_row.addWidget(self.clear_fit_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
@@ -506,6 +830,45 @@ class CameraApp(QtWidgets.QMainWindow):
         self.axis_plot_v.setMinimumHeight(140)
         self.axis_plot_v.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.axis_plot_v)
+
+        window.hide()
+        return window
+
+    def _build_calibration_window(self) -> QtWidgets.QWidget:
+        window = QtWidgets.QWidget(None, QtCore.Qt.WindowType.Window)
+        window.setWindowTitle("mm/px Calibration")
+        window.resize(360, 160)
+
+        layout = QtWidgets.QVBoxLayout(window)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        info_label = QtWidgets.QLabel(
+            "Check Measure, pick Calib X or Calib Y, click two points on the live view, drag to adjust, then press Done to enter the real length (mm)."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #ccc;")
+        layout.addWidget(info_label)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.calib_x_btn = QtWidgets.QPushButton("Calib X")
+        self.calib_x_btn.clicked.connect(lambda: self._start_calibration(axis="x"))
+        btn_row.addWidget(self.calib_x_btn)
+        self.calib_y_btn = QtWidgets.QPushButton("Calib Y")
+        self.calib_y_btn.clicked.connect(lambda: self._start_calibration(axis="y"))
+        btn_row.addWidget(self.calib_y_btn)
+        self.calib_done_btn = QtWidgets.QPushButton("Done")
+        self.calib_done_btn.clicked.connect(self._finish_calibration)
+        btn_row.addWidget(self.calib_done_btn)
+        self.calib_clear_btn = QtWidgets.QPushButton("Clear")
+        self.calib_clear_btn.clicked.connect(self.clear_calibration)
+        btn_row.addWidget(self.calib_clear_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self.calibration_status_label = QtWidgets.QLabel("Idle. Choose Calib X or Calib Y to begin.")
+        self.calibration_status_label.setWordWrap(True)
+        layout.addWidget(self.calibration_status_label)
 
         window.hide()
         return window
@@ -603,6 +966,9 @@ class CameraApp(QtWidgets.QMainWindow):
         self.gray_checkbox = QtWidgets.QCheckBox("Grayscale")
         self.gray_checkbox.stateChanged.connect(self.toggle_grayscale)
         row2.addWidget(self.gray_checkbox)
+        self.measure_checkbox = QtWidgets.QCheckBox("Measure")
+        self.measure_checkbox.stateChanged.connect(self.toggle_measure_window)
+        row2.addWidget(self.measure_checkbox)
         row2.addStretch(1)
 
         layout.addLayout(row1)
@@ -736,11 +1102,65 @@ class CameraApp(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self.camera = None
+        if self.cv_thread:
+            self.cv_thread.stop()
+            self.cv_thread.join(timeout=1.0)
+            self.cv_thread = None
+        if self.pylon_thread:
+            self.pylon_thread.stop()
+            self.pylon_thread.join(timeout=1.0)
+            self.pylon_thread = None
+        self._use_cv = False
+        self._use_pylon = False
+        self.cv_index = None
+        self.pylon_device_info = None
         self._set_camera_controls_enabled(False)
         self.status_label.setText("Stopped")
         self.setWindowTitle("Live View - No camera")
 
     def _configure_controls_from_camera(self):
+        if self._use_cv:
+            # Best-effort populate from OpenCV capture if available.
+            self._set_camera_controls_enabled(True)
+            exp_val = 10_000
+            gain_val = 0
+            if self.cv_thread:
+                exp_us, gain = self.cv_thread.get_props()
+                if exp_us:
+                    exp_val = int(exp_us)
+                if gain is not None:
+                    try:
+                        gain_val = int(gain)
+                    except Exception:
+                        gain_val = 0
+            self.exposure_spin.setRange(1, 10_000_000)
+            self.exposure_slider.setRange(1, 10_000_000)
+            self._sync_exposure_controls(exp_val)
+            self.gain_slider.setRange(0, 30)
+            self._sync_gain_controls(gain_val)
+            return
+        if self._use_pylon:
+            self._set_camera_controls_enabled(True)
+            exp_min, exp_max = 1, 10_000_000
+            gain_min, gain_max = 0, 30
+            exp_val = 10_000
+            gain_val = 0
+            if self.pylon_thread:
+                try:
+                    (exp_min, exp_max), (gain_min, gain_max) = self.pylon_thread.get_limits()
+                    exp_us, gain = self.pylon_thread.get_props()
+                    if exp_us:
+                        exp_val = int(exp_us)
+                    if gain is not None:
+                        gain_val = int(gain)
+                except Exception:
+                    pass
+            self.exposure_spin.setRange(int(exp_min), int(max(exp_max, exp_min + 1)))
+            self.exposure_slider.setRange(int(exp_min), int(max(exp_max, exp_min + 1)))
+            self._sync_exposure_controls(exp_val)
+            self.gain_slider.setRange(int(gain_min), int(max(gain_max, gain_min + 1)))
+            self._sync_gain_controls(gain_val)
+            return
         if not self.camera:
             return
         exp_min = 1
@@ -765,40 +1185,76 @@ class CameraApp(QtWidgets.QMainWindow):
     def _connect_first_available_camera(self, show_message: bool = True, force: bool = False) -> bool:
         if force:
             self._dispose_camera()
-        elif self.camera:
+        elif self.camera or (self._use_cv and self.cv_index is not None) or (self._use_pylon and self.pylon_device_info):
             return True
 
+        # Prefer Thorlabs if available, else try first generic.
         if self.sdk is None:
             try:
                 self.sdk = TLCameraSDK()
-            except Exception as exc:
-                if show_message:
-                    QtWidgets.QMessageBox.critical(self, "Error", f"Failed to initialize camera SDK: {exc}")
-                self.status_label.setText("SDK init failed")
-                return False
+            except Exception:
+                self.sdk = None
+        tsi_list = []
+        if self.sdk is not None:
+            try:
+                tsi_list = self.sdk.discover_available_cameras()
+            except Exception:
+                tsi_list = []
 
+        if tsi_list:
+            return self._open_tsi_camera(tsi_list[0], show_message=show_message)
+
+        if _HAVE_PYLON:
+            pylon_list = self._discover_pylon_devices()
+            if pylon_list:
+                return self._open_pylon_camera(pylon_list[0], show_message=show_message)
+
+        if _HAVE_OPENCV:
+            generic_indices = self._discover_generic_indices()
+            if generic_indices:
+                return self._open_generic_camera(generic_indices[0], show_message=show_message)
+
+        if show_message:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No camera",
+                "No cameras detected. Connect a camera and try again.",
+            )
+        self.status_label.setText("No camera detected")
+        self.setWindowTitle("Live View - No camera")
+        self._set_camera_controls_enabled(False)
+        return False
+
+    def _discover_generic_indices(self, max_test: int = 5) -> list[int]:
+        indices = []
+        if not _HAVE_OPENCV:
+            return indices
+        max_test = max(max_test, 15)  # broaden search to catch IR/aux streams
+        for i in range(max_test):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(i, cv2.CAP_MSMF)
+            if cap.isOpened():
+                indices.append(i)
+            cap.release()
+        return indices
+
+    def _discover_pylon_devices(self) -> list:
+        if not _HAVE_PYLON:
+            return []
         try:
-            camera_list = self.sdk.discover_available_cameras()
-        except Exception as exc:
-            if show_message:
-                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to discover cameras: {exc}")
-            self.status_label.setText("Camera discovery failed")
-            return False
+            return list(pylon.TlFactory.GetInstance().EnumerateDevices())
+        except Exception:
+            return []
 
-        if not camera_list:
-            if show_message:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "No camera",
-                    "No Thorlabs cameras detected. Connect a camera and try again.",
-                )
-            self.status_label.setText("No camera detected")
-            self.setWindowTitle("Live View - No camera")
-            self._set_camera_controls_enabled(False)
-            return False
-
+    def _open_tsi_camera(self, cam_id: str, show_message: bool = True) -> bool:
         try:
-            self.camera = self.sdk.open_camera(camera_list[0])
+            self.camera = self.sdk.open_camera(cam_id)
+            self._use_cv = False
+            self._use_pylon = False
+            self.cv_index = None
+            self.pylon_device_info = None
             self.camera.frames_per_trigger_zero_for_unlimited = 0
             self.camera.image_poll_timeout_ms = 50
             self.setWindowTitle(f"Live View - {self.camera.name}")
@@ -814,11 +1270,91 @@ class CameraApp(QtWidgets.QMainWindow):
             self._set_camera_controls_enabled(False)
             return False
 
+    def _open_generic_camera(self, index: int, show_message: bool = True) -> bool:
+        if not _HAVE_OPENCV:
+            if show_message:
+                QtWidgets.QMessageBox.information(self, "Unavailable", "OpenCV not installed.")
+            return False
+        self._use_cv = True
+        self._use_pylon = False
+        self.cv_index = index
+        self.pylon_device_info = None
+        self.camera = None
+        self._set_camera_controls_enabled(False)
+        self.setWindowTitle(f"Live View - DirectShow #{index}")
+        self.status_label.setText(f"Connected: DirectShow #{index}")
+        return True
+
+    def _open_pylon_camera(self, device_info, show_message: bool = True) -> bool:
+        if not _HAVE_PYLON:
+            if show_message:
+                QtWidgets.QMessageBox.information(self, "Unavailable", "Pylon SDK not installed.")
+            return False
+        self._use_pylon = True
+        self._use_cv = False
+        self.pylon_device_info = device_info
+        self.cv_index = None
+        self.camera = None
+        name = getattr(device_info, "GetFriendlyName", lambda: "Basler")()
+        self.setWindowTitle(f"Live View - {name}")
+        self.status_label.setText(f"Connected: {name}")
+        self._set_camera_controls_enabled(True)
+        return True
+
     def _ensure_camera(self, show_message: bool = True) -> bool:
         return self._connect_first_available_camera(show_message=show_message)
 
     def connect_camera(self):
-        self._connect_first_available_camera(show_message=True, force=True)
+        self._show_camera_selection_dialog()
+
+    def _show_camera_selection_dialog(self):
+        # Discover available sources
+        tsi_list = []
+        if self.sdk is None:
+            try:
+                self.sdk = TLCameraSDK()
+            except Exception:
+                self.sdk = None
+        if self.sdk is not None:
+            try:
+                tsi_list = self.sdk.discover_available_cameras()
+            except Exception:
+                tsi_list = []
+        generic_indices = self._discover_generic_indices() if _HAVE_OPENCV else []
+        pylon_list = self._discover_pylon_devices() if _HAVE_PYLON else []
+
+        options = []
+        for cam_id in tsi_list:
+            options.append(("tsi", cam_id, f"Thorlabs: {cam_id}"))
+        for idx in generic_indices:
+            options.append(("cv", idx, f"DirectShow #{idx}"))
+        for dev in pylon_list:
+            try:
+                friendly = dev.GetFriendlyName()
+            except Exception:
+                friendly = "Basler Pylon"
+            options.append(("pylon", dev, f"Basler: {friendly}"))
+
+        if not options:
+            QtWidgets.QMessageBox.information(self, "No cameras", "No cameras detected.")
+            return
+
+        items = [opt[2] for opt in options]
+        item, ok = QtWidgets.QInputDialog.getItem(
+            self, "Select Camera", "Choose a camera:", items, 0, False
+        )
+        if not ok or not item:
+            return
+        choice = options[items.index(item)]
+
+        # Apply selection
+        self._dispose_camera()
+        if choice[0] == "tsi":
+            self._open_tsi_camera(choice[1], show_message=True)
+        elif choice[0] == "cv":
+            self._open_generic_camera(choice[1], show_message=True)
+        elif choice[0] == "pylon":
+            self._open_pylon_camera(choice[1], show_message=True)
 
     def start_live(self):
         if self._live:
@@ -826,6 +1362,53 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self._ensure_camera():
             return
         self.status_label.setText("Starting...")
+        if self._use_pylon:
+            if not _HAVE_PYLON or self.pylon_device_info is None:
+                QtWidgets.QMessageBox.critical(self, "Error", "Pylon SDK not available or device missing.")
+                self.status_label.setText("Failed to start")
+                return
+            try:
+                self.pylon_thread = PylonVideoThread(self.pylon_device_info)
+                self.acq_thread = self.pylon_thread
+                self.pylon_thread.start()
+                self._live = True
+                name = getattr(self.pylon_device_info, "GetFriendlyName", lambda: "Basler")( )
+                self.status_label.setText(f"Live (Basler {name})")
+                try:
+                    self._configure_controls_from_camera()
+                except Exception:
+                    pass
+                return
+            except Exception as exc:
+                self.pylon_thread = None
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to start Pylon stream: {exc}")
+                self.status_label.setText("Failed to start")
+                return
+        if self._use_cv:
+            if not _HAVE_OPENCV:
+                QtWidgets.QMessageBox.critical(self, "Error", "OpenCV not installed.")
+                self.status_label.setText("Failed to start")
+                return
+            if self.cv_index is None:
+                QtWidgets.QMessageBox.critical(self, "Error", "No generic camera index selected.")
+                self.status_label.setText("Failed to start")
+                return
+            # Quick sanity check that the capture can be opened before spinning the thread.
+            test_cap = cv2.VideoCapture(self.cv_index, cv2.CAP_DSHOW) if _HAVE_OPENCV else None
+            if not (test_cap and test_cap.isOpened()):
+                if test_cap:
+                    test_cap.release()
+                QtWidgets.QMessageBox.critical(self, "Error", f"Could not open DirectShow #{self.cv_index}.")
+                self.status_label.setText("Failed to start")
+                return
+            test_cap.release()
+            self.cv_thread = GenericVideoThread(self.cv_index)
+            self.acq_thread = self.cv_thread
+            self.cv_thread.start()
+            self._live = True
+            self.status_label.setText(f"Live (DirectShow #{self.cv_index})")
+            return
+
         try:
             self.camera.arm(2)
             self.camera.issue_software_trigger()
@@ -850,7 +1433,11 @@ class CameraApp(QtWidgets.QMainWindow):
             self.acq_thread.stop()
             self.acq_thread.join(timeout=1.0)
             self.acq_thread = None
-        if self.camera:
+        if self.cv_thread:
+            self.cv_thread = None
+        if getattr(self, "pylon_thread", None):
+            self.pylon_thread = None
+        if self.camera and not self._use_cv:
             try:
                 self.camera.disarm()
             except Exception:
@@ -861,6 +1448,24 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self._ensure_camera():
             return
         try:
+            if self._use_cv:
+                val = int(self.exposure_spin.value())
+                if self.cv_thread and self.cv_thread.set_exposure_us(val):
+                    self._sync_exposure_controls(val)
+                else:
+                    QtWidgets.QMessageBox.information(
+                        self, "Not supported", "Exposure control not supported for this camera."
+                    )
+                return
+            if self._use_pylon:
+                val = int(self.exposure_spin.value())
+                if self.pylon_thread and self.pylon_thread.set_exposure_us(val):
+                    self._sync_exposure_controls(val)
+                else:
+                    QtWidgets.QMessageBox.information(
+                        self, "Not supported", "Exposure control not supported for this camera."
+                    )
+                return
             self._apply_exposure(int(self.exposure_spin.value()))
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set exposure: {exc}")
@@ -870,6 +1475,22 @@ class CameraApp(QtWidgets.QMainWindow):
             return
         try:
             val = int(value) if value is not None else int(self.gain_slider.value())
+            if self._use_cv:
+                if self.cv_thread and self.cv_thread.set_gain(val):
+                    self._sync_gain_controls(val)
+                else:
+                    QtWidgets.QMessageBox.information(
+                        self, "Not supported", "Gain control not supported for this camera."
+                    )
+                return
+            if self._use_pylon:
+                if self.pylon_thread and self.pylon_thread.set_gain(val):
+                    self._sync_gain_controls(val)
+                else:
+                    QtWidgets.QMessageBox.information(
+                        self, "Not supported", "Gain control not supported for this camera."
+                    )
+                return
             self._apply_gain(val)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set gain: {exc}")
@@ -890,6 +1511,7 @@ class CameraApp(QtWidgets.QMainWindow):
             self.mm_per_px_x = float(value)
         elif axis == "y":
             self.mm_per_px_y = float(value)
+        self._update_calibration_status()
         # refresh hover text if desired; no explicit refresh needed for display
 
     def _poll_queue(self):
@@ -902,7 +1524,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 pass
 
     def _on_exposure_slider(self, value: int):
-        if not self.camera:
+        if not (self.camera or self._use_cv or self._use_pylon):
             return
         self.exposure_spin.blockSignals(True)
         self.exposure_spin.setValue(float(value))
@@ -913,11 +1535,21 @@ class CameraApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set exposure: {exc}")
 
     def _on_exposure_slider_fine(self, value: int):
-        if not self.camera:
+        if not (self.camera or self._use_cv or self._use_pylon):
             return
         self._on_exposure_slider(value)
 
     def _apply_exposure(self, value: int):
+        if self._use_cv:
+            if self.cv_thread and self.cv_thread.set_exposure_us(int(value)):
+                self._sync_exposure_controls(int(value))
+                return
+            raise RuntimeError("Exposure control not supported on this camera")
+        if self._use_pylon:
+            if self.pylon_thread and self.pylon_thread.set_exposure_us(int(value)):
+                self._sync_exposure_controls(int(value))
+                return
+            raise RuntimeError("Exposure control not supported on this camera")
         if not self.camera:
             raise RuntimeError("No camera connected")
         self.camera.exposure_time_us = int(value)
@@ -939,7 +1571,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self.exposure_value_label.setText(f"{int(value)} us")
 
     def _on_gain_slider(self, value: int):
-        if not self.camera:
+        if not (self.camera or self._use_cv or self._use_pylon):
             return
         try:
             self._apply_gain(value)
@@ -947,6 +1579,16 @@ class CameraApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set gain: {exc}")
 
     def _apply_gain(self, value: int):
+        if self._use_cv:
+            if self.cv_thread and self.cv_thread.set_gain(int(value)):
+                self._sync_gain_controls(int(value))
+                return
+            raise RuntimeError("Gain control not supported on this camera")
+        if self._use_pylon:
+            if self.pylon_thread and self.pylon_thread.set_gain(int(value)):
+                self._sync_gain_controls(int(value))
+                return
+            raise RuntimeError("Gain control not supported on this camera")
         if not self.camera:
             raise RuntimeError("No camera connected")
         self.camera.gain = int(value)
@@ -961,6 +1603,7 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _display_frame(self, payload: FramePayload):
         self.last_payload = payload
+        self._filtered_np_image = self._apply_image_filter_np(payload.np_image)
         self._refresh_image_view()
 
     def _refresh_image_view(self):
@@ -1068,6 +1711,159 @@ class CameraApp(QtWidgets.QMainWindow):
         else:
             self.fit_window.hide()
 
+    def toggle_measure_window(self, state: int):
+        try:
+            checked = QtCore.Qt.CheckState(state) == QtCore.Qt.CheckState.Checked
+        except Exception:
+            checked = bool(state)
+        if not getattr(self, "calibration_window", None):
+            return
+        if checked:
+            if not self._calibration_window_positioned:
+                anchor_geom = None
+                if getattr(self, "controls_window", None):
+                    ctrl_geom = self.controls_window.frameGeometry()
+                    if ctrl_geom.isValid():
+                        anchor_geom = ctrl_geom
+                self._position_window_near_main(
+                    self.calibration_window,
+                    QtCore.QPoint(18, 420 if anchor_geom else 180),
+                    anchor_geom=anchor_geom,
+                )
+                self._calibration_window_positioned = True
+            if not self.calibration_window.isVisible():
+                self.calibration_window.show()
+            self.calibration_window.raise_()
+        else:
+            self.calibration_window.hide()
+            self.clear_calibration()
+        self._sync_panning_enabled()
+
+    def _start_calibration(self, axis: str):
+        if axis not in ("x", "y"):
+            return
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "No image", "Capture or start live view before calibrating.")
+            return
+        if getattr(self, "measure_checkbox", None):
+            self.measure_checkbox.setChecked(True)
+        self._calibration_axis = axis
+        self._calibration_last_axis = axis
+        self._calibration_points = []
+        self._calibration_dragging = False
+        self._calibration_drag_mode = None
+        self._calibration_drag_start = None
+        self._calibration_drag_start_points = []
+        self._line_select_mode = False
+        self._line_edit_mode = False
+        if getattr(self, "calibration_window", None):
+            self.calibration_window.show()
+            self.calibration_window.raise_()
+        self._update_calibration_status()
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+
+    def _calibration_pixel_length(self) -> Optional[float]:
+        if len(self._calibration_points) != 2:
+            return None
+        axis = self._calibration_axis or self._calibration_last_axis
+        if not axis:
+            return None
+        p1, p2 = self._calibration_points
+        if axis == "x":
+            return float(abs(p2[0] - p1[0]))
+        if axis == "y":
+            return float(abs(p2[1] - p1[1]))
+        return float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+
+    def _finish_calibration(self):
+        axis = self._calibration_axis or self._calibration_last_axis
+        if axis not in ("x", "y") or len(self._calibration_points) != 2:
+            QtWidgets.QMessageBox.information(
+                self, "Calibration", "Select two points for Calib X or Calib Y first."
+            )
+            return
+        px_len = self._calibration_pixel_length()
+        if not px_len or px_len <= 0:
+            QtWidgets.QMessageBox.information(self, "Calibration", "Span length is zero; pick two distinct points.")
+            return
+        current_mm_per_px = self.mm_per_px_x if axis == "x" else self.mm_per_px_y
+        suggested_mm = px_len * current_mm_per_px
+        length_mm, ok = QtWidgets.QInputDialog.getDouble(
+            self,
+            "Enter real length",
+            f"Measured length along {axis.upper()} (mm):",
+            float(suggested_mm),
+            0.000001,
+            1e9,
+            decimals=6,
+        )
+        if not ok:
+            return
+        if length_mm <= 0:
+            QtWidgets.QMessageBox.information(self, "Calibration", "Length must be positive.")
+            return
+        mm_per_px = float(length_mm) / float(px_len)
+        if mm_per_px <= 0:
+            QtWidgets.QMessageBox.information(self, "Calibration", "Calculated mm/px is invalid.")
+            return
+        if axis == "x":
+            self.mm_px_x_spin.setValue(mm_per_px)
+        elif axis == "y":
+            self.mm_px_y_spin.setValue(mm_per_px)
+        self._calibration_axis = None
+        self._calibration_dragging = False
+        self._calibration_drag_mode = None
+        self._calibration_drag_start = None
+        self._update_calibration_status()
+        self._sync_panning_enabled()
+        QtWidgets.QMessageBox.information(
+            self, "Calibration", f"{axis.upper()} calibrated: {mm_per_px:.6f} mm/px (span {px_len:.2f} px)."
+        )
+        self._refresh_image_view()
+
+    def clear_calibration(self):
+        self._calibration_axis = None
+        self._calibration_last_axis = None
+        self._calibration_points = []
+        self._calibration_dragging = False
+        self._calibration_drag_mode = None
+        self._calibration_drag_start = None
+        self._calibration_drag_start_points = []
+        self._update_calibration_status()
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+
+    def _update_calibration_status(self):
+        label = getattr(self, "calibration_status_label", None)
+        if not label:
+            return
+        axis = self._calibration_axis
+        px_len = self._calibration_pixel_length()
+        if axis:
+            if len(self._calibration_points) == 0:
+                text = f"{axis.upper()} calibration: click first point on the live view."
+            elif len(self._calibration_points) == 1:
+                text = f"{axis.upper()} calibration: click second point."
+            else:
+                mm_per_px = self.mm_per_px_x if axis == "x" else self.mm_per_px_y
+                approx_mm = px_len * mm_per_px if px_len is not None else 0.0
+                text = (
+                    f"{axis.upper()} calibration: drag points to adjust, then press Done. "
+                    f"Span {px_len:.1f} px (~{approx_mm:.3f} mm)."
+                )
+        elif len(self._calibration_points) == 2 and self._calibration_last_axis:
+            axis = self._calibration_last_axis
+            mm_per_px = self.mm_per_px_x if axis == "x" else self.mm_per_px_y
+            approx_mm = px_len * mm_per_px if px_len is not None else 0.0
+            text = (
+                f"Last {axis.upper()} span: {px_len:.1f} px (~{approx_mm:.3f} mm). "
+                "Press Calib X or Calib Y to adjust again."
+            )
+        else:
+            text = "Idle. Choose Calib X or Calib Y to begin."
+        label.setText(text)
+
     def _update_histogram_window(self, payload: Optional[FramePayload]):
         if not getattr(self, "hist_window", None):
             return
@@ -1099,7 +1895,7 @@ class CameraApp(QtWidgets.QMainWindow):
             self._in_hist_update = False
 
     def _build_histogram_pixmap(self, payload: FramePayload) -> QtGui.QPixmap:
-        data = payload.np_image
+        data = self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
         if data.ndim == 3:
             if self._force_grayscale:
                 data = np.mean(data, axis=2)
@@ -1128,7 +1924,14 @@ class CameraApp(QtWidgets.QMainWindow):
         return QtGui.QPixmap.fromImage(image)
 
     def _update_line_plot(
-        self, x_axis: np.ndarray, profile: np.ndarray, fit_curve: np.ndarray, length_mm: float, fwhm_mm: float, waist_mm: float
+        self,
+        x_axis: np.ndarray,
+        profile: np.ndarray,
+        fit_curve: np.ndarray,
+        length_mm: float,
+        fwhm_mm: float,
+        waist_mm: float,
+        raw_profile: Optional[np.ndarray] = None,
     ):
         width = 540
         height = 240
@@ -1136,8 +1939,11 @@ class CameraApp(QtWidgets.QMainWindow):
         if x_axis.size == 0:
             self.line_plot_label.clear()
             return
-        y_min = float(min(np.min(profile), np.min(fit_curve)))
-        y_max = float(max(np.max(profile), np.max(fit_curve)))
+        y_values = [profile, fit_curve]
+        if raw_profile is not None:
+            y_values.append(raw_profile)
+        y_min = float(min(np.min(arr) for arr in y_values))
+        y_max = float(max(np.max(arr) for arr in y_values))
         if y_max - y_min < 1e-6:
             y_max = y_min + 1.0
         def scale_x(x):
@@ -1152,7 +1958,16 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.setPen(QtGui.QPen(QtGui.QColor(70, 70, 70), 1))
         painter.drawRect(margin, margin, width - 2 * margin, height - 2 * margin)
 
-        # Profile line
+        # Optional raw profile
+        if raw_profile is not None:
+            painter.setPen(QtGui.QPen(QtGui.QColor(140, 140, 140), 1, QtCore.Qt.PenStyle.DashLine))
+            for i in range(1, len(x_axis)):
+                painter.drawLine(
+                    QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(raw_profile[i - 1])),
+                    QtCore.QPointF(scale_x(x_axis[i]), scale_y(raw_profile[i])),
+                )
+
+        # Filtered profile line
         painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255), 2))
         for i in range(1, len(x_axis)):
             painter.drawLine(
@@ -1169,15 +1984,16 @@ class CameraApp(QtWidgets.QMainWindow):
             )
 
         painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
+        waist_diam_mm = waist_mm * 2.0
         painter.drawText(
             margin,
             margin - 6,
-            f"Line profile (cyan) & fit (orange) | 2*w={waist_mm:.3f}mm, FWHM={fwhm_mm:.3f}mm",
+            f"Line profile (cyan) & fit (orange) | 2*w={waist_diam_mm:.3f}mm, FWHM={fwhm_mm:.3f}mm",
         )
         painter.drawText(
             width // 2 - 60,
             height - 6,
-            f"Distance: 0–{x_axis[-1]:.1f}px ({max(length_mm,0):.3f}mm)",
+            f"Distance: 0-{x_axis[-1]:.1f}px ({max(length_mm,0):.3f}mm)",
         )
         painter.save()
         painter.translate(12, height // 2 + 40)
@@ -1233,11 +2049,12 @@ class CameraApp(QtWidgets.QMainWindow):
                 QtCore.QPointF(scale_x(x_axis[i]), scale_y(fit_curve[i])),
             )
         painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
-        painter.drawText(margin, margin - 6, f"{title} | 2*w={waist_mm:.3f}mm, FWHM={fwhm_mm:.3f}mm")
+        waist_diam_mm = waist_mm * 2.0
+        painter.drawText(margin, margin - 6, f"{title} | 2*w={waist_diam_mm:.3f}mm, FWHM={fwhm_mm:.3f}mm")
         painter.drawText(
             width // 2 - 70,
             height - 6,
-            f"0–{x_axis[-1]:.1f}px ({max(length_mm,0):.3f}mm)",
+            f"0-{x_axis[-1]:.1f}px ({max(length_mm,0):.3f}mm)",
         )
         painter.save()
         painter.translate(12, height // 2 + 28)
@@ -1247,15 +2064,85 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.end()
         target.setPixmap(QtGui.QPixmap.fromImage(img))
 
+    def _start_calibration_drag(self, event: QtGui.QMouseEvent) -> bool:
+        axis = self._calibration_axis or self._calibration_last_axis
+        if axis is None or len(self._calibration_points) != 2:
+            return False
+        pos = event.position()
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(pos.x() / scale, pos.y() / scale)
+        p1_screen = self._screen_point_for_line(self._calibration_points[0])
+        p2_screen = self._screen_point_for_line(self._calibration_points[1])
+        hit_radius = 18.0
+        dist_p1 = float(np.hypot(pos.x() - p1_screen.x(), pos.y() - p1_screen.y()))
+        dist_p2 = float(np.hypot(pos.x() - p2_screen.x(), pos.y() - p2_screen.y()))
+        mode = None
+        if dist_p1 <= hit_radius:
+            mode = "p1"
+        elif dist_p2 <= hit_radius:
+            mode = "p2"
+        else:
+            dist_seg = self._distance_to_segment(pos, p1_screen, p2_screen)
+            if dist_seg <= hit_radius:
+                mode = "move"
+        if mode:
+            self._calibration_dragging = True
+            self._calibration_drag_mode = mode
+            self._calibration_drag_start = p_img
+            self._calibration_drag_start_points = list(self._calibration_points)
+            event.accept()
+            return True
+        return False
+
+    def _update_calibration_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._calibration_dragging or self._calibration_drag_mode is None:
+            return False
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(event.position().x() / scale, event.position().y() / scale)
+        if self._calibration_drag_start is None or not self._calibration_drag_start_points:
+            return False
+
+        dx = p_img.x() - self._calibration_drag_start.x()
+        dy = p_img.y() - self._calibration_drag_start.y()
+
+        # Follow the mouse exactly: endpoints snap to cursor, move mode offsets both points.
+        if self._calibration_drag_mode == "p1":
+            new_p1 = self._clamp_point(p_img.x(), p_img.y())
+            self._calibration_points[0] = new_p1
+            self._calibration_points[1] = self._calibration_drag_start_points[1]
+        elif self._calibration_drag_mode == "p2":
+            new_p2 = self._clamp_point(p_img.x(), p_img.y())
+            self._calibration_points[1] = new_p2
+            self._calibration_points[0] = self._calibration_drag_start_points[0]
+        elif self._calibration_drag_mode == "move":
+            start_p1, start_p2 = self._calibration_drag_start_points
+            new_p1 = self._clamp_point(start_p1[0] + dx, start_p1[1] + dy)
+            new_p2 = self._clamp_point(start_p2[0] + dx, start_p2[1] + dy)
+            self._calibration_points[0] = new_p1
+            self._calibration_points[1] = new_p2
+        event.accept()
+        self._update_calibration_status()
+        self._refresh_image_view()
+        return True
+
+    def _finish_calibration_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._calibration_dragging:
+            return False
+        self._calibration_dragging = False
+        self._calibration_drag_mode = None
+        self._calibration_drag_start = None
+        self._calibration_drag_start_points = []
+        self._update_calibration_status()
+        event.accept()
+        return True
+
     def _enter_line_edit_mode(self):
         self._line_select_mode = False
         self._line_edit_mode = True
         self._line_profile = None
         self._line_fit = None
-        self.run_line_fit_btn.setEnabled(True)
-        self.run_360_btn.setEnabled(True)
         self._sync_panning_enabled()
-        self.line_fit_status.setText("Line fit: drag endpoints or line, then press Run Line Fit.")
+        self.line_fit_status.setText("Line fit: drag endpoints or line, then press SciPy Fit.")
         self.line_plot_label.clear()
         self._refresh_image_view()
 
@@ -1344,9 +2231,14 @@ class CameraApp(QtWidgets.QMainWindow):
     def _sample_line_profile(self, p1: tuple[int, int], p2: tuple[int, int], min_samples: int = 20):
         if not self.last_payload:
             return None
-        data = self.last_payload.np_image
-        if data.ndim == 3:
-            data = np.mean(data, axis=2)
+        raw_data = self.last_payload.np_image
+        filtered_data = self._filtered_np_image if self._filtered_np_image is not None else raw_data
+        if raw_data.ndim == 3:
+            raw_data = np.mean(raw_data, axis=2)
+        if filtered_data.ndim == 3:
+            filtered_data = np.mean(filtered_data, axis=2)
+        raw_data = np.asarray(raw_data, dtype=np.float64)
+        filtered_data = np.asarray(filtered_data, dtype=np.float64)
         x1, y1 = p1
         x2, y2 = p2
         length_px = float(np.hypot(x2 - x1, y2 - y1))
@@ -1356,46 +2248,282 @@ class CameraApp(QtWidgets.QMainWindow):
         xs = np.linspace(x1, x2, num)
         ys = np.linspace(y1, y2, num)
 
-        def _sample_point(ix, iy):
-            if ix < 0 or iy < 0 or ix >= data.shape[1] - 1 or iy >= data.shape[0] - 1:
-                ix = min(max(ix, 0), data.shape[1] - 1)
-                iy = min(max(iy, 0), data.shape[0] - 1)
-                return float(data[int(iy), int(ix)])
+        def _sample_point(arr: np.ndarray, ix, iy):
+            if ix < 0 or iy < 0 or ix >= arr.shape[1] - 1 or iy >= arr.shape[0] - 1:
+                ix = min(max(ix, 0), arr.shape[1] - 1)
+                iy = min(max(iy, 0), arr.shape[0] - 1)
+                return float(arr[int(iy), int(ix)])
             x0 = int(np.floor(ix))
             y0 = int(np.floor(iy))
             dx_f = ix - x0
             dy_f = iy - y0
-            v00 = data[y0, x0]
-            v10 = data[y0, x0 + 1]
-            v01 = data[y0 + 1, x0]
-            v11 = data[y0 + 1, x0 + 1]
+            v00 = arr[y0, x0]
+            v10 = arr[y0, x0 + 1]
+            v01 = arr[y0 + 1, x0]
+            v11 = arr[y0 + 1, x0 + 1]
             top = v00 * (1 - dx_f) + v10 * dx_f
             bottom = v01 * (1 - dx_f) + v11 * dx_f
             return float(top * (1 - dy_f) + bottom * dy_f)
 
-        profile = np.array([_sample_point(ix, iy) for ix, iy in zip(xs, ys)], dtype=np.float64)
+        raw_profile = np.array([_sample_point(raw_data, ix, iy) for ix, iy in zip(xs, ys)], dtype=np.float64)
+        filtered_profile = np.array([_sample_point(filtered_data, ix, iy) for ix, iy in zip(xs, ys)], dtype=np.float64)
         length_mm = float(np.hypot((x2 - x1) * self.mm_per_px_x, (y2 - y1) * self.mm_per_px_y))
         px_axis = np.linspace(0, length_px, num)
-        return px_axis, profile, length_px, length_mm
+        return px_axis, raw_profile, filtered_profile, length_px, length_mm
 
     def _fit_1d_gaussian(self, profile: np.ndarray):
-        baseline = float(np.percentile(profile, 10.0))
-        weights = np.clip(profile - baseline, 0.0, None)
+        # Legacy wrapper retained for compatibility; now uses the general fitter below.
+        fit = self._fit_1d_profile(profile, models=("gauss",))
+        if not fit:
+            return None
+        return fit["baseline"], fit["amplitude"], fit["mu"], fit["width"], fit["fit_curve"]
+
+    def _fit_1d_profile(self, profile: np.ndarray, models=("gauss", "lorentz")) -> Optional[dict]:
+        """Fit a 1D profile with Gaussian and/or Lorentzian candidates and pick the best by MSE."""
+        if profile is None or profile.size < 3:
+            return None
+        prof = np.nan_to_num(np.asarray(profile, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        baseline = float(np.percentile(prof, 10.0))
+        window = min(11, prof.size if prof.size % 2 == 1 else prof.size - 1)
+        smooth = prof
+        if window >= 3:
+            kernel = np.ones(window, dtype=np.float64) / window
+            smooth = np.convolve(prof, kernel, mode="same")
+        weights = np.clip(smooth - baseline, 0.0, None)
         if weights.sum() <= 0:
             return None
-        num = profile.size
-        mu = float(np.sum(weights * np.arange(num)) / weights.sum())
-        var = float(np.sum(weights * (np.arange(num) - mu) ** 2) / weights.sum())
-        sigma = float(np.sqrt(max(var, 1e-9)))
-        amplitude = float(profile.max() - baseline)
-        fit_curve = baseline + amplitude * np.exp(-0.5 * ((np.arange(num) - mu) / sigma) ** 2)
-        return baseline, amplitude, mu, sigma, fit_curve
 
+        peak_idx = int(np.argmax(weights))
+        mu0 = float(peak_idx)
+        if 0 < peak_idx < weights.size - 1:
+            y0, y1, y2 = weights[peak_idx - 1], weights[peak_idx], weights[peak_idx + 1]
+            denom = (y0 - 2 * y1 + y2)
+            if abs(denom) > 1e-9:
+                mu0 = float(peak_idx + 0.5 * (y0 - y2) / denom)
+        mu0 = float(np.clip(mu0, 0.0, prof.size - 1.0))
+
+        amp0 = float(max(prof[int(round(mu0))] - baseline if 0 <= int(round(mu0)) < prof.size else prof.max() - baseline, 1e-9))
+
+        def _estimate_fwhm():
+            half = baseline + amp0 * 0.5
+            left = peak_idx
+            while left > 0 and prof[left] > half:
+                left -= 1
+            right = peak_idx
+            while right < prof.size - 1 and prof[right] > half:
+                right += 1
+            def interp_edge(idx_from, idx_to):
+                if idx_to == idx_from:
+                    return float(idx_from)
+                y_from = prof[idx_from]
+                y_to = prof[idx_to]
+                if abs(y_to - y_from) < 1e-9:
+                    return float(idx_from)
+                return float(idx_from + (half - y_from) / (y_to - y_from))
+            left_x = interp_edge(left, min(left + 1, prof.size - 1))
+            right_x = interp_edge(max(right - 1, 0), right)
+            width = max(right_x - left_x, 1.0)
+            return float(width)
+
+        fwhm_est = _estimate_fwhm()
+        sigma0 = max(fwhm_est / 2.3548, 0.3)
+        gamma0 = max(fwhm_est / 2.0, 0.3)
+
+        x = np.arange(prof.size, dtype=np.float64)
+        mu_candidates = np.clip(mu0 + np.linspace(-2.0, 2.0, 5), 0.0, prof.size - 1.0)
+        best = None
+
+        for model in models:
+            if model == "gauss":
+                width_candidates = [max(sigma0 * s, 0.2) for s in (0.6, 0.85, 1.0, 1.3, 1.8)]
+                def fn(mu_val, w_val):
+                    return baseline + amp0 * np.exp(-0.5 * ((x - mu_val) / max(w_val, 0.2)) ** 2)
+            elif model == "lorentz":
+                width_candidates = [max(gamma0 * s, 0.2) for s in (0.6, 0.85, 1.0, 1.3, 1.8)]
+                def fn(mu_val, w_val):
+                    w_safe = max(w_val, 0.2)
+                    return baseline + amp0 * (w_safe**2) / ((x - mu_val) ** 2 + w_safe**2)
+            else:
+                continue
+
+            for mu_val in mu_candidates:
+                for width_val in width_candidates:
+                    curve = fn(mu_val, width_val)
+                    err = float(np.mean((prof - curve) ** 2))
+                    if best is None or err < best["sse"]:
+                        best = {
+                            "model": model,
+                            "baseline": baseline,
+                            "amplitude": amp0,
+                            "mu": float(mu_val),
+                            "width": float(width_val),
+                            "fit_curve": curve,
+                            "sse": err,
+                        }
+
+        if not best:
+            return None
+        var = float(np.var(prof))
+        best["r2"] = max(0.0, 1.0 - best["sse"] / var) if var > 0 else 0.0
+        return best
+
+    def _apply_profile_filter(self, profile: np.ndarray) -> np.ndarray:
+        """Apply optional FFT-based filters (low/high/band pass) to a 1D profile."""
+        if profile is None:
+            return profile
+        data = np.asarray(profile, dtype=np.float64)
+        if data.size < 2:
+            return data
+        mode = getattr(self, "filter_mode_combo", None)
+        mode_text = mode.currentText() if mode else "None"
+        low_spin = getattr(self, "filter_low_spin", None)
+        high_spin = getattr(self, "filter_high_spin", None)
+        low_cut = float(low_spin.value()) if low_spin else 0.0
+        high_cut = float(high_spin.value()) if high_spin else 0.5
+        low_cut = min(max(low_cut, 0.0), 0.5)
+        high_cut = min(max(high_cut, 0.0), 0.5)
+        n = data.size
+        if mode_text == "None" or n < 2:
+            return data
+        freqs = np.fft.rfftfreq(n, d=1.0)
+        spectrum = np.fft.rfft(data)
+        if mode_text == "Low-pass":
+            mask = freqs <= high_cut
+        elif mode_text == "High-pass":
+            mask = freqs >= low_cut
+        elif mode_text == "Band-pass":
+            if low_cut >= high_cut:
+                mask = freqs >= low_cut
+            else:
+                mask = (freqs >= low_cut) & (freqs <= high_cut)
+        else:
+            return data
+        if not np.any(mask):
+            return data
+        filtered = np.fft.irfft(spectrum * mask, n=n)
+        return np.asarray(filtered, dtype=np.float64)
+
+    def _apply_image_filter_np(self, data: np.ndarray) -> Optional[np.ndarray]:
+        """Apply selected FFT filter (low/high/band) to the full image (per channel)."""
+        if data is None:
+            return None
+        mode = getattr(self, "filter_mode_combo", None)
+        mode_text = mode.currentText() if mode else "None"
+        low_spin = getattr(self, "filter_low_spin", None)
+        high_spin = getattr(self, "filter_high_spin", None)
+        low_cut = float(low_spin.value()) if low_spin else 0.0
+        high_cut = float(high_spin.value()) if high_spin else 0.5
+        low_cut = min(max(low_cut, 0.0), 0.5)
+        high_cut = min(max(high_cut, 0.0), 0.5)
+        if mode_text == "None":
+            return data
+
+        arr = np.asarray(data, dtype=np.float64)
+
+        def filter_channel(chan: np.ndarray) -> np.ndarray:
+            if chan.ndim != 2:
+                return chan
+            h, w = chan.shape
+            if h < 2 or w < 2:
+                return chan
+            fy = np.fft.fftfreq(h, d=1.0)
+            fx = np.fft.fftfreq(w, d=1.0)
+            fx_grid, fy_grid = np.meshgrid(fx, fy)
+            radius = np.sqrt(fx_grid * fx_grid + fy_grid * fy_grid)
+            if mode_text == "Low-pass":
+                mask = radius <= high_cut
+            elif mode_text == "High-pass":
+                mask = radius >= low_cut
+            elif mode_text == "Band-pass":
+                if low_cut >= high_cut:
+                    mask = radius >= low_cut
+                else:
+                    mask = (radius >= low_cut) & (radius <= high_cut)
+            else:
+                return chan
+            if not np.any(mask):
+                return chan
+            spec = np.fft.fft2(chan)
+            filtered = np.fft.ifft2(spec * mask).real
+            return filtered
+
+        if arr.ndim == 2:
+            filtered = filter_channel(arr)
+        elif arr.ndim == 3 and arr.shape[2] >= 1:
+            channels = [filter_channel(arr[..., c]) for c in range(arr.shape[2])]
+            filtered = np.stack(channels, axis=2)
+        else:
+            return data
+
+        if np.issubdtype(data.dtype, np.integer):
+            info = np.iinfo(data.dtype)
+            filtered = np.clip(np.rint(filtered), info.min, info.max).astype(data.dtype)
+        else:
+            filtered = np.asarray(filtered, dtype=data.dtype)
+        return filtered
+
+    def _sync_filter_controls(self):
+        mode_text = self.filter_mode_combo.currentText() if getattr(self, "filter_mode_combo", None) else "None"
+        if getattr(self, "filter_low_spin", None):
+            self.filter_low_spin.setEnabled(mode_text in ("High-pass", "Band-pass"))
+        if getattr(self, "filter_high_spin", None):
+            self.filter_high_spin.setEnabled(mode_text in ("Low-pass", "Band-pass"))
+
+    def _on_filter_changed(self, *args):
+        self._sync_filter_controls()
+        if self.last_payload:
+            self._filtered_np_image = self._apply_image_filter_np(self.last_payload.np_image)
+            self._refresh_image_view()
+        if len(self._line_points) == 2:
+            # Re-run line fit with new filter for immediate visual feedback (without exporting multiple copies)
+            self._compute_line_fit(self._line_points[0], self._line_points[1], export=False)
+            self.line_fit_status.setText("Filter applied to image. Press Run Line Fit again to export.")
+
+    def _write_cross_section_csv(self, sections: dict[str, tuple[np.ndarray, np.ndarray]], out_dir: str):
+        """Persist raw cross-section data into a CSV inside out_dir."""
+        if not sections:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        names = list(sections.keys())
+        max_len = max(len(val[0]) for val in sections.values())
+        csv_path = os.path.join(out_dir, "cross_sections.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["pixel"] + names)
+            for idx in range(max_len):
+                pixel_val = ""
+                for axis, _ in sections.values():
+                    if idx < len(axis):
+                        pixel_val = float(axis[idx])
+                        break
+                row = [pixel_val]
+                for name in names:
+                    axis, profile = sections[name]
+                    if idx < len(profile):
+                        row.append(float(profile[idx]))
+                    else:
+                        row.append("")
+                writer.writerow(row)
+
+
+    @staticmethod
+    def _np_to_pil_image(array: np.ndarray) -> Image.Image:
+        arr = np.asarray(array)
+        if arr.ndim == 2:
+            if arr.dtype != np.uint8:
+                arr = np.clip(np.rint(arr), 0, 255).astype(np.uint8)
+            return Image.fromarray(arr, mode="L")
+        elif arr.ndim == 3:
+            if arr.dtype != np.uint8:
+                arr = np.clip(np.rint(arr), 0, 255).astype(np.uint8)
+            return Image.fromarray(arr, mode="RGB")
+        raise ValueError("Unsupported array shape for conversion to PIL")
 
     def _prepare_display_image(self, payload: FramePayload) -> Image.Image:
-        img = payload.pil_image.copy()
-        if self._force_grayscale and img.mode != "L":
-            img = img.convert("L")
+        base_np = self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
+        if self._force_grayscale and base_np.ndim == 3:
+            base_np = np.mean(base_np, axis=2)
+        img = self._np_to_pil_image(base_np)
         if self._gauss_fit:
             img = self._draw_gaussian_contour(img, self._gauss_fit)
         if len(self._line_points) == 2:
@@ -1404,6 +2532,8 @@ class CameraApp(QtWidgets.QMainWindow):
             for seg in self._axis_lines:
                 p1, p2, color = seg
                 img = self._draw_line_segment(img, [p1, p2], color=(color.red(), color.green(), color.blue()))
+        img = self._draw_calibration_overlay(img)
+        img = self._draw_exposure_gain_overlay(img)
         return img
 
     def _draw_gaussian_contour(self, image: Image.Image, fit: dict) -> Image.Image:
@@ -1463,6 +2593,13 @@ class CameraApp(QtWidgets.QMainWindow):
             draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=2)
         return image
 
+    def _draw_calibration_overlay(self, image: Image.Image) -> Image.Image:
+        axis = self._calibration_axis or self._calibration_last_axis
+        if len(self._calibration_points) != 2 or axis not in ("x", "y"):
+            return image
+        color = (0, 200, 255)
+        return self._draw_line_segment(image, self._calibration_points, color=color)
+
     def _get_overlay_font(self, size: int = 18):
         if not hasattr(self, "_cached_overlay_font") or self._cached_overlay_font is None:
             font = None
@@ -1476,6 +2613,68 @@ class CameraApp(QtWidgets.QMainWindow):
             self._cached_overlay_font = font
         return self._cached_overlay_font
 
+    def _draw_exposure_gain_overlay(self, image: Image.Image) -> Image.Image:
+        """Overlay exposure/gain in the top-right during live view."""
+        if not self._live:
+            return image
+
+        exp_us = None
+        gain_val = None
+        try:
+            if self._use_pylon and self.pylon_thread:
+                exp_us, gain_val = self.pylon_thread.get_props()
+            elif self._use_cv and self.cv_thread:
+                exp_us, gain_val = self.cv_thread.get_props()
+            elif self.camera:
+                exp_us = int(getattr(self.camera, "exposure_time_us", 0))
+                gain_val = getattr(self.camera, "gain", None)
+        except Exception:
+            return image
+
+        if exp_us is None and gain_val is None:
+            return image
+
+        def _fmt(val, suffix: str = "") -> str:
+            if val is None:
+                return "-"
+            try:
+                if isinstance(val, (float, int)):
+                    if isinstance(val, float) and abs(val - round(val)) > 1e-3:
+                        return f"{val:.2f}{suffix}"
+                    return f"{int(round(val))}{suffix}"
+            except Exception:
+                pass
+            return f"{val}{suffix}"
+
+        exp_text = _fmt(exp_us, " usec")
+        gain_text = _fmt(gain_val)
+        text = f"exp: {exp_text}, gain: {gain_text}"
+
+        font = self._get_overlay_font(18)
+        base = image.convert("RGBA") if image.mode != "RGBA" else image.copy()
+        draw = ImageDraw.Draw(base)
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+        except Exception:
+            text_w, text_h = font.getsize(text) if font else (len(text) * 8, 18)
+
+        pad = 6
+        margin = 8
+        img_w, img_h = base.size
+        text_x = max(0, img_w - text_w - pad - margin)
+        text_y = margin
+        rect = (
+            max(0, text_x - pad),
+            max(0, text_y - pad),
+            min(img_w, text_x + text_w + pad),
+            min(img_h, text_y + text_h + pad),
+        )
+        draw.rectangle(rect, fill=(0, 0, 0, 128))
+        draw.text((text_x, text_y), text, fill=(255, 215, 0, 255), font=font)
+        return base.convert("RGB") if image.mode != "RGBA" else base
+
     def compute_gaussian_fit(self):
         if not self.last_payload:
             QtWidgets.QMessageBox.information(self, "No selection", "Select a cross location first.")
@@ -1488,7 +2687,7 @@ class CameraApp(QtWidgets.QMainWindow):
         if center is None:
             QtWidgets.QMessageBox.information(self, "No selection", "Select a cross location first.")
             return
-        data = self.last_payload.np_image
+        data = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
         if data.ndim == 3:
             data = np.mean(data, axis=2)
         x0, y0 = center
@@ -1581,7 +2780,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self.gauss_result_label.setText(text)
         self._refresh_image_view()
 
-    def _compute_line_fit(self, p1: tuple[int, int], p2: tuple[int, int]):
+    def _compute_line_fit(self, p1: tuple[int, int], p2: tuple[int, int], export: bool = True):
         if not self.last_payload:
             return
         self.line_fit_status.setText("Line fit: computing...")
@@ -1589,47 +2788,72 @@ class CameraApp(QtWidgets.QMainWindow):
         if sampled is None:
             self.line_fit_status.setText("Line fit failed: points are identical.")
             return
-        px_axis, profile, length_px, length_mm = sampled
-        fit = self._fit_1d_gaussian(profile)
+        px_axis, raw_profile, filtered_profile, length_px, length_mm = sampled
+        profile = filtered_profile
+        fit = self._fit_1d_profile(profile)
         if fit is None:
             self.line_fit_status.setText("Line fit failed: no signal above baseline.")
             return
-        baseline, amplitude, mu, sigma, fit_curve = fit
+        model = fit.get("model", "gauss")
+        baseline = fit["baseline"]
+        amplitude = fit["amplitude"]
+        mu = fit["mu"]
+        width = fit["width"]
+        fit_curve = fit["fit_curve"]
+        r2 = fit.get("r2", 0.0)
 
-        self._line_profile = (px_axis, profile)
+        self._line_profile = (px_axis, raw_profile, profile)
         self._line_fit = {
             "baseline": baseline,
             "amplitude": amplitude,
             "mu": mu,
-            "sigma": sigma,
+            "width": width,
+            "model": model,
+            "r2": r2,
             "length_px": length_px,
             "length_mm": length_mm,
         }
         px_step = length_px / max(len(px_axis) - 1, 1)
         mm_step = length_mm / max(len(px_axis) - 1, 1)
-        sigma_px = sigma * px_step
-        sigma_mm = sigma * mm_step
-        fwhm_px = 2.3548 * sigma_px
-        fwhm_mm = 2.3548 * sigma_mm
-        w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
-        w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
+        if model == "lorentz":
+            gamma_px = width * px_step
+            gamma_mm = width * mm_step
+            fwhm_px = 2.0 * gamma_px
+            fwhm_mm = 2.0 * gamma_mm
+            w1e2_px = 2.0 * gamma_px * np.sqrt(np.e**2 - 1.0)
+            w1e2_mm = 2.0 * gamma_mm * np.sqrt(np.e**2 - 1.0)
+            width_label = "gamma"
+            width_px_val = gamma_px
+            width_mm_val = gamma_mm
+        else:
+            sigma_px = width * px_step
+            sigma_mm = width * mm_step
+            fwhm_px = 2.3548 * sigma_px
+            fwhm_mm = 2.3548 * sigma_mm
+            w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
+            w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
+            width_label = "sigma"
+            width_px_val = sigma_px
+            width_mm_val = sigma_mm
         mu_pos_px = (mu / max(len(px_axis) - 1, 1)) * length_px
         mu_pos_mm = (mu / max(len(px_axis) - 1, 1)) * length_mm
-        self._update_line_plot(px_axis, profile, fit_curve, length_mm, fwhm_mm, w1e2_mm)
+        self._update_line_plot(px_axis, profile, fit_curve, length_mm, fwhm_mm, w1e2_mm, raw_profile=raw_profile)
         self.line_fit_status.setText(
-            "Line fit OK: "
+            f"Line fit OK ({model}): "
             f"mu={mu_pos_px:.2f}px ({mu_pos_mm:.3f}mm), "
-            f"sigma={sigma_px:.2f}px ({sigma_mm:.3f}mm), "
+            f"{width_label}={width_px_val:.2f}px ({width_mm_val:.3f}mm), "
             f"FWHM={fwhm_px:.2f}px ({fwhm_mm:.3f}mm), "
-            f"1/e^2={w1e2_px:.2f}px ({w1e2_mm:.3f}mm)"
+            f"1/e^2={w1e2_px:.2f}px ({w1e2_mm:.3f}mm), "
+            f"R^2={r2:.3f}"
         )
+        self._pending_sections["line"] = (px_axis, raw_profile)
         self._refresh_image_view()
 
     def run_line_fit(self):
         if len(self._line_points) != 2:
             self.line_fit_status.setText("Line fit: select two points first.")
             return
-        self._compute_line_fit(self._line_points[0], self._line_points[1])
+        self._compute_line_fit(self._line_points[0], self._line_points[1], export=True)
         self._sync_panning_enabled()
 
     def _moment_center_and_cov(self, data: np.ndarray):
@@ -1652,30 +2876,48 @@ class CameraApp(QtWidgets.QMainWindow):
         sampled = self._sample_line_profile(p1, p2)
         if sampled is None:
             return None
-        px_axis, profile, length_px, length_mm = sampled
-        fit = self._fit_1d_gaussian(profile)
+        px_axis, raw_profile, filtered_profile, length_px, length_mm = sampled
+        profile = filtered_profile
+        fit = self._fit_1d_profile(profile)
         if fit is None:
             return None
-        baseline, amplitude, mu, sigma, fit_curve = fit
+        model = fit.get("model", "gauss")
+        mu = fit["mu"]
+        width = fit["width"]
+        fit_curve = fit["fit_curve"]
         px_step = length_px / max(len(px_axis) - 1, 1)
         mm_step = length_mm / max(len(px_axis) - 1, 1)
-        sigma_px = sigma * px_step
-        sigma_mm = sigma * mm_step
-        fwhm_px = 2.3548 * sigma_px
-        fwhm_mm = 2.3548 * sigma_mm
-        w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
-        w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
+        if model == "lorentz":
+            gamma_px = width * px_step
+            gamma_mm = width * mm_step
+            fwhm_px = 2.0 * gamma_px
+            fwhm_mm = 2.0 * gamma_mm
+            w1e2_px = 2.0 * gamma_px * np.sqrt(np.e**2 - 1.0)
+            w1e2_mm = 2.0 * gamma_mm * np.sqrt(np.e**2 - 1.0)
+            width_px_val = gamma_px
+            width_mm_val = gamma_mm
+        else:
+            sigma_px = width * px_step
+            sigma_mm = width * mm_step
+            fwhm_px = 2.3548 * sigma_px
+            fwhm_mm = 2.3548 * sigma_mm
+            w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
+            w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
+            width_px_val = sigma_px
+            width_mm_val = sigma_mm
         mu_pos_px = (mu / max(len(px_axis) - 1, 1)) * length_px
         mu_pos_mm = (mu / max(len(px_axis) - 1, 1)) * length_mm
         return {
             "name": name,
             "px_axis": px_axis,
             "profile": profile,
+            "raw_profile": raw_profile,
             "fit_curve": fit_curve,
             "length_px": length_px,
             "length_mm": length_mm,
-            "sigma_px": sigma_px,
-            "sigma_mm": sigma_mm,
+            "model": model,
+            "width_px": width_px_val,
+            "width_mm": width_mm_val,
             "fwhm_px": fwhm_px,
             "fwhm_mm": fwhm_mm,
             "w1e2_px": w1e2_px,
@@ -1691,7 +2933,7 @@ class CameraApp(QtWidgets.QMainWindow):
         if len(self._line_points) != 2:
             self.axis_fit_status.setText("360 fit: select a line first.")
             return
-        data = self.last_payload.np_image
+        data = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
         if data.ndim == 3:
             data = np.mean(data, axis=2)
         center_stats = self._moment_center_and_cov(data)
@@ -1748,7 +2990,181 @@ class CameraApp(QtWidgets.QMainWindow):
             f"H FWHM={fit_h['fwhm_px']:.2f}px ({fit_h['fwhm_mm']:.3f}mm); "
             f"V FWHM={fit_v['fwhm_px']:.2f}px ({fit_v['fwhm_mm']:.3f}mm)"
         )
+        self._pending_sections["horizontal"] = (fit_h["px_axis"], fit_h["raw_profile"])
+        self._pending_sections["vertical"] = (fit_v["px_axis"], fit_v["raw_profile"])
         # Build a Gaussian overlay using the 360 fit widths and center for correct scale
+        self._gauss_fit = {
+            "mu_x": cx,
+            "mu_y": cy,
+            "w1e2_major": fit_h["w1e2_px"],
+            "w1e2_minor": fit_v["w1e2_px"],
+            "w1e2_major_mm": fit_h["w1e2_mm"],
+            "w1e2_minor_mm": fit_v["w1e2_mm"],
+            "angle_deg": 0.0,
+            "waist_ratio": (fit_h["w1e2_mm"] / fit_v["w1e2_mm"]) if fit_v["w1e2_mm"] else 0.0,
+            "label_text": f"{fit_h['w1e2_px']*2:.2f}px ({fit_h['w1e2_mm']*2:.3f}mm) x {fit_v['w1e2_px']*2:.2f}px ({fit_v['w1e2_mm']*2:.3f}mm) | ratio {(fit_h['w1e2_mm'] / fit_v['w1e2_mm']) if fit_v['w1e2_mm'] else 0.0:.3f}",
+        }
+        self._refresh_image_view()
+        self._line_edit_mode = False
+        self._sync_panning_enabled()
+
+    def run_scipy_fit(self):
+        if not self.last_payload:
+            self.axis_fit_status.setText("SciPy fit: no image.")
+            return
+        data = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        if data.ndim == 3:
+            data = np.mean(data, axis=2)
+        center_stats = self._moment_center_and_cov(data)
+        if center_stats is None:
+            self.axis_fit_status.setText("SciPy fit failed: no signal for centroid.")
+            return
+        mu_x, mu_y, _, _, _ = center_stats
+        h, w = data.shape
+        cx = int(round(np.clip(mu_x, 0, w - 1)))
+        cy = int(round(np.clip(mu_y, 0, h - 1)))
+
+        try:
+            res_h = gaussian_or_lorentzian_aic(np.arange(w, dtype=float), data[cy, :], mode="auto")[0]
+            res_v = gaussian_or_lorentzian_aic(np.arange(h, dtype=float), data[:, cx], mode="auto")[0]
+        except Exception as exc:
+            self.axis_fit_status.setText(f"SciPy fit failed: {exc}")
+            return
+
+        def _metrics(res, x_axis: np.ndarray, profile: np.ndarray, px_step: float, mm_step: float):
+            model = res["best_model"]
+            width_param = float(res["p_best"][2])
+            if model == "gaussian":
+                sigma_px = width_param
+                fwhm_px = 2.3548 * sigma_px
+                w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
+            else:
+                gamma_px = width_param
+                fwhm_px = gamma_px
+                w1e2_px = gamma_px  # approximate radius with FWHM for overlay consistency
+            fwhm_mm = fwhm_px * px_step if model == "gaussian" else fwhm_px * px_step
+            w1e2_mm = w1e2_px * px_step
+            return {
+                "model": model,
+                "width_px": width_param,
+                "fwhm_px": fwhm_px,
+                "fwhm_mm": fwhm_mm,
+                "w1e2_px": w1e2_px,
+                "w1e2_mm": w1e2_mm,
+                "fit_curve": res["yhat_best"],
+                "profile": profile,
+                "px_axis": x_axis,
+                "r2": res.get("r2_best", 0.0),
+            }
+
+        x_axis_h = np.arange(w, dtype=float)
+        x_axis_v = np.arange(h, dtype=float)
+        fit_h = _metrics(res_h, x_axis_h, data[cy, :], self.mm_per_px_x, self.mm_per_px_x)
+        fit_v = _metrics(res_v, x_axis_v, data[:, cx], self.mm_per_px_y, self.mm_per_px_y)
+
+        self._axis_lines = [
+            ((0, cy), (w - 1, cy), QtGui.QColor(0, 200, 255)),
+            ((cx, 0), (cx, h - 1), QtGui.QColor(255, 120, 0)),
+        ]
+        self._axis_fit_results = {"H": fit_h, "V": fit_v}
+        self._axis_center_px = (float(cx), float(cy))
+        self.cross_pos = (cx, cy)
+
+        self._update_axis_plot(
+            self.axis_plot_h,
+            "Horizontal profile (cyan) + fit (orange)",
+            fit_h["px_axis"],
+            fit_h["profile"],
+            fit_h["fit_curve"],
+            (fit_h["px_axis"][-1] - fit_h["px_axis"][0] if fit_h["px_axis"].size else 0) * self.mm_per_px_x,
+            fit_h["fwhm_mm"],
+            fit_h["w1e2_mm"],
+        )
+        self._update_axis_plot(
+            self.axis_plot_v,
+            "Vertical profile (cyan) + fit (orange)",
+            fit_v["px_axis"],
+            fit_v["profile"],
+            fit_v["fit_curve"],
+            (fit_v["px_axis"][-1] - fit_v["px_axis"][0] if fit_v["px_axis"].size else 0) * self.mm_per_px_y,
+            fit_v["fwhm_mm"],
+            fit_v["w1e2_mm"],
+        )
+
+        self.axis_fit_status.setText(
+            "SciPy fit: "
+            f"H model={fit_h['model']} FWHM={fit_h['fwhm_px']:.2f}px ({fit_h['fwhm_mm']:.3f}mm); "
+            f"V model={fit_v['model']} FWHM={fit_v['fwhm_px']:.2f}px ({fit_v['fwhm_mm']:.3f}mm)"
+        )
+        self._pending_sections["horizontal"] = (fit_h["px_axis"], fit_h["profile"])
+        self._pending_sections["vertical"] = (fit_v["px_axis"], fit_v["profile"])
+
+        # Optional: run SciPy on the user-defined line if two points are set.
+        if len(self._line_points) == 2:
+            sampled = self._sample_line_profile(self._line_points[0], self._line_points[1])
+            if sampled is None:
+                self.line_fit_status.setText("Line fit failed: points are identical.")
+            else:
+                px_axis, raw_profile, filtered_profile, length_px, length_mm = sampled
+                try:
+                    res_line = gaussian_or_lorentzian_aic(px_axis, filtered_profile, mode="auto")[0]
+                except Exception as exc:
+                    self.line_fit_status.setText(f"SciPy line fit failed: {exc}")
+                else:
+                    model = res_line["best_model"]
+                    width_param = float(res_line["p_best"][2])
+                    mu_pos_px = float(res_line["p_best"][1])
+                    if length_px > 0:
+                        mu_pos_mm = mu_pos_px / length_px * length_mm
+                    else:
+                        mu_pos_mm = 0.0
+                    if model == "gaussian":
+                        sigma_px = width_param
+                        fwhm_px = 2.3548 * sigma_px
+                        w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
+                    else:
+                        gamma_px = width_param
+                        fwhm_px = gamma_px
+                        w1e2_px = gamma_px
+                    px_step_line = length_px / max(len(px_axis) - 1, 1)
+                    mm_step_line = length_mm / max(len(px_axis) - 1, 1)
+                    mm_per_px_line = (mm_step_line / px_step_line) if px_step_line > 0 else 0.0
+                    fwhm_mm = fwhm_px * mm_per_px_line
+                    w1e2_mm = w1e2_px * mm_per_px_line
+
+                    fit_curve = res_line["yhat_best"]
+                    self._line_profile = (px_axis, raw_profile, filtered_profile)
+                    self._line_fit = {
+                        "model": model,
+                        "width_px": width_param,
+                        "fwhm_px": fwhm_px,
+                        "fwhm_mm": fwhm_mm,
+                        "w1e2_px": w1e2_px,
+                        "w1e2_mm": w1e2_mm,
+                        "mu_px": mu_pos_px,
+                        "mu_mm": mu_pos_mm,
+                        "r2": res_line.get("r2_best", 0.0),
+                    }
+                    self._update_line_plot(
+                        px_axis,
+                        filtered_profile,
+                        fit_curve,
+                        length_mm,
+                        fwhm_mm,
+                        w1e2_mm,
+                        raw_profile=raw_profile,
+                    )
+                    self.line_fit_status.setText(
+                        f"SciPy line fit ({model}): "
+                        f"mu={mu_pos_px:.2f}px ({mu_pos_mm:.3f}mm), "
+                        f"FWHM={fwhm_px:.2f}px ({fwhm_mm:.3f}mm), "
+                        f"1/e^2={w1e2_px:.2f}px ({w1e2_mm:.3f}mm), "
+                        f"R^2={self._line_fit['r2']:.3f}"
+                    )
+                    self._pending_sections["line"] = (px_axis, raw_profile)
+        else:
+            self.line_fit_status.setText("Line fit: select two points, then press SciPy Fit.")
+
         self._gauss_fit = {
             "mu_x": cx,
             "mu_y": cy,
@@ -1777,22 +3193,42 @@ class CameraApp(QtWidgets.QMainWindow):
         elif obj is getattr(self, "fit_window", None):
             if event.type() == QtCore.QEvent.Type.Move:
                 self._fit_window_positioned = True
+        elif obj is getattr(self, "calibration_window", None):
+            if event.type() == QtCore.QEvent.Type.Move:
+                self._calibration_window_positioned = True
         elif event.type() == QtCore.QEvent.Type.Wheel and obj in (
             getattr(self, "image_label", None),
             getattr(self, "scroll_area", None).viewport() if getattr(self, "scroll_area", None) else None,
         ):
             if self._handle_wheel_zoom(event, obj):
                 return True
-        elif obj is getattr(self, "image_label", None) and len(self._line_points) == 2:
-            if event.type() == QtCore.QEvent.Type.MouseButtonPress:
-                if self._start_line_drag(event):
-                    return True
-            elif event.type() == QtCore.QEvent.Type.MouseMove:
-                if self._update_line_drag(event):
-                    return True
-            elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
-                if self._finish_line_drag(event):
-                    return True
+        elif obj is getattr(self, "image_label", None):
+            calib_drag_ready = (
+                len(self._calibration_points) == 2
+                and self._calibration_axis is not None
+                and (getattr(self, "measure_checkbox", None) is None or self.measure_checkbox.isChecked())
+            )
+            handled = False
+            if calib_drag_ready:
+                if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                    handled = self._start_calibration_drag(event)
+                elif event.type() == QtCore.QEvent.Type.MouseMove:
+                    handled = self._update_calibration_drag(event)
+                elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                    handled = self._finish_calibration_drag(event)
+            if handled:
+                return True
+
+            if len(self._line_points) == 2:
+                if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                    if self._start_line_drag(event):
+                        return True
+                elif event.type() == QtCore.QEvent.Type.MouseMove:
+                    if self._update_line_drag(event):
+                        return True
+                elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                    if self._finish_line_drag(event):
+                        return True
         return super().eventFilter(obj, event)
 
     @staticmethod
@@ -1859,11 +3295,45 @@ class CameraApp(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            self.last_payload.pil_image.save(path)
-            self.status_label.setText(f"Saved {path}")
-            self._settings.setValue("last_image_dir", os.path.dirname(path))
+            # Build timestamped folder alongside the chosen path.
+            base_dir = os.path.dirname(path) or DATA_DIR
+            timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+            out_dir = os.path.join(base_dir, timestamp)
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Save what is currently shown: filtered image plus overlays (fits/axes/line/cross).
+            display_image = self._prepare_display_image(self.last_payload)
+            if self.cross_pos:
+                display_image = self._draw_cross(display_image, self.cross_pos)
+            main_name = os.path.basename(path) or "image.png"
+            main_path = os.path.join(out_dir, main_name)
+            display_image.save(main_path)
+
+            # Also save the fit plots if they exist.
+            self._save_label_plot(self.line_plot_label, os.path.join(out_dir, "line_plot.png"))
+            self._save_label_plot(self.axis_plot_h, os.path.join(out_dir, "axis_h.png"))
+            self._save_label_plot(self.axis_plot_v, os.path.join(out_dir, "axis_v.png"))
+
+            # Save cross-section CSV for the latest fits (if available).
+            self._write_cross_section_csv(self._pending_sections, out_dir)
+
+            self.status_label.setText(f"Saved to {out_dir}")
+            self._settings.setValue("last_image_dir", base_dir)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save: {exc}")
+
+    def _save_label_plot(self, label: QtWidgets.QLabel, path: str):
+        """Save a QLabel pixmap (if present) to disk."""
+        if not label:
+            return
+        pixmap = label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+        try:
+            pixmap.save(path)
+        except Exception:
+            # Silent fail; saving plots is best-effort.
+            pass
 
     def load_image(self):
         last_dir = self._settings.value("last_image_dir", DATA_DIR, type=str)
@@ -1926,7 +3396,8 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _sync_panning_enabled(self):
         if getattr(self, "image_label", None):
-            self.image_label.set_panning_enabled(not self._fit_to_window and not self._line_edit_mode)
+            allow_pan = not self._fit_to_window and not self._line_edit_mode and not self._calibration_dragging
+            self.image_label.set_panning_enabled(allow_pan)
 
     def _reset_pan(self):
         if not getattr(self, "scroll_area", None):
@@ -1949,20 +3420,19 @@ class CameraApp(QtWidgets.QMainWindow):
         self._line_fit = None
         self._axis_lines = []
         self._axis_fit_results = {}
-        self.line_fit_status.setText("Line fit: click first point...")
+        self.line_fit_status.setText("Line fit: click first point, then second, then press SciPy Fit.")
         self.line_plot_label.clear()
-        self.run_line_fit_btn.setEnabled(False)
-        self.run_360_btn.setEnabled(False)
         self.axis_fit_status.setText("360 fit: not computed.")
         self.axis_plot_h.clear()
         self.axis_plot_v.clear()
+        self._pending_sections = {}
         self._refresh_image_view()
 
     def on_mouse_move(self, x: int, y: int):
         if not self.last_payload:
             self.coord_label.setText("x: -, y: -, val: -")
             return
-        img = self.last_payload.np_image
+        img = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
         scale = self._last_render_scale if self._last_render_scale else 1.0
         h, w = img.shape[:2]
         src_x = int(x / scale)
@@ -1973,12 +3443,14 @@ class CameraApp(QtWidgets.QMainWindow):
                 val = val.tolist()
             gray_val = None
             if img.ndim == 2:
-                gray_val = int(self.last_payload.np_image[src_y, src_x])
+                gray_val = int(img[src_y, src_x])
             elif img.ndim == 3:
-                gray_val = int(np.mean(self.last_payload.np_image[src_y, src_x]))
+                gray_val = int(np.mean(img[src_y, src_x]))
             gray_suffix = f", gray: {gray_val}" if gray_val is not None else ""
-            mm_x = src_x * self.mm_per_px_x
-            mm_y = src_y * self.mm_per_px_y
+            # Show mm relative to the cross if set; pixels remain absolute.
+            origin_x, origin_y = self.cross_pos if self.cross_pos else (0, 0)
+            mm_x = (src_x - origin_x) * self.mm_per_px_x
+            mm_y = (src_y - origin_y) * self.mm_per_px_y
             mm_suffix = f", x_mm: {mm_x:.3f}, y_mm: {mm_y:.3f}"
             self.coord_label.setText(f"x: {src_x}, y: {src_y}, val: {val}{gray_suffix}{mm_suffix}")
         else:
@@ -2057,10 +3529,17 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self.last_payload:
             return
         scale = self._last_render_scale if self._last_render_scale else 1.0
-        img = self.last_payload.np_image
+        img = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
         h, w = img.shape[:2]
         src_x = int(x / scale)
         src_y = int(y / scale)
+        if self._calibration_axis:
+            if 0 <= src_x < w and 0 <= src_y < h and len(self._calibration_points) < 2:
+                self._calibration_points.append((src_x, src_y))
+                self._calibration_last_axis = self._calibration_axis
+                self._update_calibration_status()
+                self._refresh_image_view()
+            return
         if self._line_select_mode:
             if 0 <= src_x < w and 0 <= src_y < h:
                 self._line_points.append((src_x, src_y))
@@ -2072,22 +3551,37 @@ class CameraApp(QtWidgets.QMainWindow):
                     return
             return
         if 0 <= src_x < w and 0 <= src_y < h:
-            gray = img
-            if img.ndim == 3:
-                gray = np.mean(img, axis=2)
-            search_radius = 6
-            xs = slice(max(0, src_x - search_radius), min(w, src_x + search_radius + 1))
-            ys = slice(max(0, src_y - search_radius), min(h, src_y + search_radius + 1))
-            patch = gray[ys, xs]
-            max_x, max_y = src_x, src_y
-            if patch.size > 0:
-                rel_y, rel_x = np.unravel_index(np.argmax(patch), patch.shape)
-                max_x = xs.start + rel_x
-                max_y = ys.start + rel_y
-            self.cross_pos = (max_x, max_y)
+            # Place the cross exactly where the user clicked (no snapping).
+            self.cross_pos = (src_x, src_y)
             self._refresh_image_view()
             self.gauss_result_label.setText("Gauss X: -, Y: -")
             self._gauss_fit = None
+
+    def clear_fits(self):
+        """Clear line/axis fits, plots, overlays, and pending exports (keeps the cross)."""
+        self._line_select_mode = False
+        self._line_edit_mode = False
+        self._line_points = []
+        self._line_profile = None
+        self._line_fit = None
+        self._axis_lines = []
+        self._axis_fit_results = {}
+        self._axis_center_px = None
+        self._gauss_fit = None
+        self._pending_sections = {}
+        if getattr(self, "line_plot_label", None):
+            self.line_plot_label.clear()
+        if getattr(self, "axis_plot_h", None):
+            self.axis_plot_h.clear()
+        if getattr(self, "axis_plot_v", None):
+            self.axis_plot_v.clear()
+        if getattr(self, "line_fit_status", None):
+            self.line_fit_status.setText("Line fit: not computed.")
+        if getattr(self, "axis_fit_status", None):
+            self.axis_fit_status.setText("360 fit: not computed.")
+        if getattr(self, "gauss_result_label", None):
+            self.gauss_result_label.setText("Gauss X: -, Y: -")
+        self._refresh_image_view()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         self.poll_timer.stop()
@@ -2107,6 +3601,9 @@ class CameraApp(QtWidgets.QMainWindow):
             if getattr(self, "fit_window", None):
                 self._save_window_state(self.fit_window, "fit_window")
                 self.fit_window.close()
+            if getattr(self, "calibration_window", None):
+                self._save_window_state(self.calibration_window, "calibration_window")
+                self.calibration_window.close()
             self._save_window_state(self, "main_window")
         except Exception:
             pass

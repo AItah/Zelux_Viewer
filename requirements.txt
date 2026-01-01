@@ -4,3 +4,7 @@ pillow
 tifffile
 numpy
 pyinstaller
+scipy
+pytest
+opencv-python
+pypylon
