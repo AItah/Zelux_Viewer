@@ -3,7 +3,7 @@ data
 dist
 build
 *.zip
-
+*.spec
 __pycache__
 # Ignore everything under "Scientific Camera Interfaces"...
 vendor/Scientific Camera Interfaces/*
