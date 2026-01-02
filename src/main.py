@@ -600,13 +600,22 @@ class CameraApp(QtWidgets.QMainWindow):
         self._hist_window_positioned = False
         self._fit_window_positioned = False
         self._calibration_window_positioned = False
-        self._calibration_axis: Optional[str] = None  # "x" or "y" while active
+        self._calibration_axis: Optional[str] = None  # "x", "y", or "both" while active
         self._calibration_last_axis: Optional[str] = None  # remember last calibrated axis for overlay
         self._calibration_points: list[tuple[int, int]] = []
         self._calibration_dragging = False
         self._calibration_drag_mode: Optional[str] = None
         self._calibration_drag_start: Optional[QtCore.QPointF] = None
         self._calibration_drag_start_points: list[tuple[int, int]] = []
+        self._measure_active_mode: Optional[str] = None  # "line" or "arc"
+        self._measure_line_points: list[tuple[int, int]] = []
+        self._measure_line_dragging = False
+        self._measure_line_drag_mode: Optional[str] = None
+        self._measure_line_drag_start: Optional[QtCore.QPointF] = None
+        self._measure_line_drag_start_points: list[tuple[int, int]] = []
+        self._measure_arc_points: list[tuple[int, int]] = []
+        self._measure_arc_dragging = False
+        self._measure_arc_drag_index: Optional[int] = None
         self._in_hist_update = False
         self._line_select_mode = False
         self._line_points: list[tuple[int, int]] = []
@@ -844,7 +853,7 @@ class CameraApp(QtWidgets.QMainWindow):
         layout.setSpacing(8)
 
         info_label = QtWidgets.QLabel(
-            "Check Measure, pick Calib X or Calib Y, click two points on the live view, drag to adjust, then press Done to enter the real length (mm)."
+            "Check Measure, pick Calib X / Calib Y / Calib Both, click two points on the live view, drag to adjust, then press Done to enter the real length (mm)."
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: #ccc;")
@@ -857,6 +866,9 @@ class CameraApp(QtWidgets.QMainWindow):
         self.calib_y_btn = QtWidgets.QPushButton("Calib Y")
         self.calib_y_btn.clicked.connect(lambda: self._start_calibration(axis="y"))
         btn_row.addWidget(self.calib_y_btn)
+        self.calib_both_btn = QtWidgets.QPushButton("Calib Both")
+        self.calib_both_btn.clicked.connect(lambda: self._start_calibration(axis="both"))
+        btn_row.addWidget(self.calib_both_btn)
         self.calib_done_btn = QtWidgets.QPushButton("Done")
         self.calib_done_btn.clicked.connect(self._finish_calibration)
         btn_row.addWidget(self.calib_done_btn)
@@ -866,9 +878,26 @@ class CameraApp(QtWidgets.QMainWindow):
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
-        self.calibration_status_label = QtWidgets.QLabel("Idle. Choose Calib X or Calib Y to begin.")
+        self.calibration_status_label = QtWidgets.QLabel("Idle. Choose Calib X, Calib Y, or Calib Both to begin.")
         self.calibration_status_label.setWordWrap(True)
         layout.addWidget(self.calibration_status_label)
+
+        measure_row = QtWidgets.QHBoxLayout()
+        self.measure_line_btn = QtWidgets.QPushButton("Line")
+        self.measure_line_btn.clicked.connect(self._start_measure_line)
+        measure_row.addWidget(self.measure_line_btn)
+        self.measure_arc_btn = QtWidgets.QPushButton("Arc")
+        self.measure_arc_btn.clicked.connect(self._start_measure_arc)
+        measure_row.addWidget(self.measure_arc_btn)
+        self.measure_clear_btn = QtWidgets.QPushButton("Clear Measure")
+        self.measure_clear_btn.clicked.connect(self._clear_measure_tools)
+        measure_row.addWidget(self.measure_clear_btn)
+        measure_row.addStretch(1)
+        layout.addLayout(measure_row)
+
+        self.measure_status_label = QtWidgets.QLabel("Measurement: Idle. Pick Line or Arc.")
+        self.measure_status_label.setWordWrap(True)
+        layout.addWidget(self.measure_status_label)
 
         window.hide()
         return window
@@ -1512,6 +1541,7 @@ class CameraApp(QtWidgets.QMainWindow):
         elif axis == "y":
             self.mm_per_px_y = float(value)
         self._update_calibration_status()
+        self._update_measure_status()
         # refresh hover text if desired; no explicit refresh needed for display
 
     def _poll_queue(self):
@@ -1737,10 +1767,11 @@ class CameraApp(QtWidgets.QMainWindow):
         else:
             self.calibration_window.hide()
             self.clear_calibration()
+            self._clear_measure_tools()
         self._sync_panning_enabled()
 
     def _start_calibration(self, axis: str):
-        if axis not in ("x", "y"):
+        if axis not in ("x", "y", "both"):
             return
         if not self.last_payload:
             QtWidgets.QMessageBox.information(self, "No image", "Capture or start live view before calibrating.")
@@ -1774,52 +1805,92 @@ class CameraApp(QtWidgets.QMainWindow):
             return float(abs(p2[0] - p1[0]))
         if axis == "y":
             return float(abs(p2[1] - p1[1]))
-        return float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+        if axis == "both":
+            return float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+        return None
 
     def _finish_calibration(self):
         axis = self._calibration_axis or self._calibration_last_axis
-        if axis not in ("x", "y") or len(self._calibration_points) != 2:
+        if axis not in ("x", "y", "both") or len(self._calibration_points) != 2:
             QtWidgets.QMessageBox.information(
-                self, "Calibration", "Select two points for Calib X or Calib Y first."
+                self, "Calibration", "Select two points for Calib X, Calib Y, or Calib Both first."
             )
             return
+        p1, p2 = self._calibration_points
+        dx_px = float(abs(p2[0] - p1[0]))
+        dy_px = float(abs(p2[1] - p1[1]))
         px_len = self._calibration_pixel_length()
         if not px_len or px_len <= 0:
             QtWidgets.QMessageBox.information(self, "Calibration", "Span length is zero; pick two distinct points.")
             return
-        current_mm_per_px = self.mm_per_px_x if axis == "x" else self.mm_per_px_y
-        suggested_mm = px_len * current_mm_per_px
-        length_mm, ok = QtWidgets.QInputDialog.getDouble(
-            self,
-            "Enter real length",
-            f"Measured length along {axis.upper()} (mm):",
-            float(suggested_mm),
-            0.000001,
-            1e9,
-            decimals=6,
-        )
-        if not ok:
+        if axis == "both" and (dx_px <= 0 or dy_px <= 0):
+            QtWidgets.QMessageBox.information(
+                self, "Calibration", "Calib Both needs a line with both X and Y components (not perfectly straight)."
+            )
             return
-        if length_mm <= 0:
-            QtWidgets.QMessageBox.information(self, "Calibration", "Length must be positive.")
-            return
-        mm_per_px = float(length_mm) / float(px_len)
-        if mm_per_px <= 0:
-            QtWidgets.QMessageBox.information(self, "Calibration", "Calculated mm/px is invalid.")
-            return
-        if axis == "x":
-            self.mm_px_x_spin.setValue(mm_per_px)
-        elif axis == "y":
-            self.mm_px_y_spin.setValue(mm_per_px)
+
+        if axis == "both":
+            current_mm_guess = float(np.hypot(dx_px * self.mm_per_px_x, dy_px * self.mm_per_px_y))
+            length_mm, ok = QtWidgets.QInputDialog.getDouble(
+                self,
+                "Enter diagonal length",
+                "Measured hypotenuse length (mm):",
+                float(current_mm_guess),
+                0.000001,
+                1e9,
+                decimals=6,
+            )
+            if not ok:
+                return
+            if length_mm <= 0:
+                QtWidgets.QMessageBox.information(self, "Calibration", "Length must be positive.")
+                return
+            angle_rad = float(np.arctan2(dy_px, dx_px))
+            dx_mm = float(np.cos(angle_rad) * length_mm)
+            dy_mm = float(np.sin(angle_rad) * length_mm)
+            mm_per_px_x = dx_mm / dx_px if dx_px > 0 else None
+            mm_per_px_y = dy_mm / dy_px if dy_px > 0 else None
+            if not mm_per_px_x or not mm_per_px_y or mm_per_px_x <= 0 or mm_per_px_y <= 0:
+                QtWidgets.QMessageBox.information(self, "Calibration", "Calculated mm/px values are invalid.")
+                return
+            self.mm_px_x_spin.setValue(mm_per_px_x)
+            self.mm_px_y_spin.setValue(mm_per_px_y)
+            msg_text = (
+                f"BOTH calibrated: X {mm_per_px_x:.6f} mm/px, Y {mm_per_px_y:.6f} mm/px (hyp {px_len:.2f} px)."
+            )
+        else:
+            current_mm_per_px = self.mm_per_px_x if axis == "x" else self.mm_per_px_y
+            suggested_mm = px_len * current_mm_per_px
+            length_mm, ok = QtWidgets.QInputDialog.getDouble(
+                self,
+                "Enter real length",
+                f"Measured length along {axis.upper()} (mm):",
+                float(suggested_mm),
+                0.000001,
+                1e9,
+                decimals=6,
+            )
+            if not ok:
+                return
+            if length_mm <= 0:
+                QtWidgets.QMessageBox.information(self, "Calibration", "Length must be positive.")
+                return
+            mm_per_px = float(length_mm) / float(px_len)
+            if mm_per_px <= 0:
+                QtWidgets.QMessageBox.information(self, "Calibration", "Calculated mm/px is invalid.")
+                return
+            if axis == "x":
+                self.mm_px_x_spin.setValue(mm_per_px)
+            elif axis == "y":
+                self.mm_px_y_spin.setValue(mm_per_px)
+            msg_text = f"{axis.upper()} calibrated: {mm_per_px:.6f} mm/px (span {px_len:.2f} px)."
         self._calibration_axis = None
         self._calibration_dragging = False
         self._calibration_drag_mode = None
         self._calibration_drag_start = None
         self._update_calibration_status()
         self._sync_panning_enabled()
-        QtWidgets.QMessageBox.information(
-            self, "Calibration", f"{axis.upper()} calibrated: {mm_per_px:.6f} mm/px (span {px_len:.2f} px)."
-        )
+        QtWidgets.QMessageBox.information(self, "Calibration", msg_text)
         self._refresh_image_view()
 
     def clear_calibration(self):
@@ -1846,22 +1917,199 @@ class CameraApp(QtWidgets.QMainWindow):
             elif len(self._calibration_points) == 1:
                 text = f"{axis.upper()} calibration: click second point."
             else:
+                if axis == "both":
+                    p1, p2 = self._calibration_points
+                    dx_px = float(abs(p2[0] - p1[0]))
+                    dy_px = float(abs(p2[1] - p1[1]))
+                    approx_mm = float(np.hypot(dx_px * self.mm_per_px_x, dy_px * self.mm_per_px_y))
+                    text = (
+                        "BOTH calibration: drag points to adjust, then press Done. "
+                        f"Hypotenuse {px_len:.1f} px (~{approx_mm:.3f} mm)."
+                    )
+                else:
+                    mm_per_px = self.mm_per_px_x if axis == "x" else self.mm_per_px_y
+                    approx_mm = px_len * mm_per_px if px_len is not None else 0.0
+                    text = (
+                        f"{axis.upper()} calibration: drag points to adjust, then press Done. "
+                        f"Span {px_len:.1f} px (~{approx_mm:.3f} mm)."
+                    )
+        elif len(self._calibration_points) == 2 and self._calibration_last_axis:
+            axis = self._calibration_last_axis
+            if axis == "both":
+                p1, p2 = self._calibration_points
+                dx_px = float(abs(p2[0] - p1[0]))
+                dy_px = float(abs(p2[1] - p1[1]))
+                approx_mm = float(np.hypot(dx_px * self.mm_per_px_x, dy_px * self.mm_per_px_y))
+                text = (
+                    f"Last BOTH span: {px_len:.1f} px (~{approx_mm:.3f} mm). "
+                    "Press Calib X/Y/Both to adjust again."
+                )
+            else:
                 mm_per_px = self.mm_per_px_x if axis == "x" else self.mm_per_px_y
                 approx_mm = px_len * mm_per_px if px_len is not None else 0.0
                 text = (
-                    f"{axis.upper()} calibration: drag points to adjust, then press Done. "
-                    f"Span {px_len:.1f} px (~{approx_mm:.3f} mm)."
+                    f"Last {axis.upper()} span: {px_len:.1f} px (~{approx_mm:.3f} mm). "
+                    "Press Calib X/Y/Both to adjust again."
                 )
-        elif len(self._calibration_points) == 2 and self._calibration_last_axis:
-            axis = self._calibration_last_axis
-            mm_per_px = self.mm_per_px_x if axis == "x" else self.mm_per_px_y
-            approx_mm = px_len * mm_per_px if px_len is not None else 0.0
-            text = (
-                f"Last {axis.upper()} span: {px_len:.1f} px (~{approx_mm:.3f} mm). "
-                "Press Calib X or Calib Y to adjust again."
-            )
         else:
-            text = "Idle. Choose Calib X or Calib Y to begin."
+            text = "Idle. Choose Calib X, Calib Y, or Calib Both to begin."
+        label.setText(text)
+
+    def _start_measure_line(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "No image", "Capture or start live view before measuring.")
+            return
+        if getattr(self, "measure_checkbox", None):
+            self.measure_checkbox.setChecked(True)
+        self._measure_active_mode = "line"
+        self._measure_line_points = []
+        self._measure_line_dragging = False
+        self._measure_line_drag_mode = None
+        self._measure_line_drag_start = None
+        self._measure_line_drag_start_points = []
+        self._measure_arc_points = []
+        self._measure_arc_dragging = False
+        self._measure_arc_drag_index = None
+        self._calibration_axis = None  # avoid eating clicks
+        self._line_select_mode = False
+        self._line_edit_mode = False
+        self._update_calibration_status()
+        self._update_measure_status()
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+
+    def _start_measure_arc(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "No image", "Capture or start live view before measuring.")
+            return
+        if getattr(self, "measure_checkbox", None):
+            self.measure_checkbox.setChecked(True)
+        self._measure_active_mode = "arc"
+        self._measure_arc_points = []
+        self._measure_arc_dragging = False
+        self._measure_arc_drag_index = None
+        self._measure_line_points = []
+        self._measure_line_dragging = False
+        self._measure_line_drag_mode = None
+        self._measure_line_drag_start = None
+        self._measure_line_drag_start_points = []
+        self._calibration_axis = None
+        self._line_select_mode = False
+        self._line_edit_mode = False
+        self._update_calibration_status()
+        self._update_measure_status()
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+
+    def _clear_measure_tools(self):
+        self._measure_active_mode = None
+        self._measure_line_points = []
+        self._measure_line_dragging = False
+        self._measure_line_drag_mode = None
+        self._measure_line_drag_start = None
+        self._measure_line_drag_start_points = []
+        self._measure_arc_points = []
+        self._measure_arc_dragging = False
+        self._measure_arc_drag_index = None
+        self._update_measure_status()
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+
+    def _measure_line_lengths(self) -> Optional[tuple[float, float]]:
+        if len(self._measure_line_points) != 2:
+            return None
+        p1, p2 = self._measure_line_points
+        dx_px = float(p2[0] - p1[0])
+        dy_px = float(p2[1] - p1[1])
+        length_px = float(np.hypot(dx_px, dy_px))
+        length_mm = float(np.hypot(dx_px * self.mm_per_px_x, dy_px * self.mm_per_px_y))
+        return length_px, length_mm
+
+    def _measure_arc_geometry(self) -> Optional[dict]:
+        if len(self._measure_arc_points) != 3:
+            return None
+        (x1, y1), (x2, y2), (x3, y3) = [tuple(map(float, pt)) for pt in self._measure_arc_points]
+        d_px = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+        if abs(d_px) < 1e-6:
+            return None
+        ux_px = (
+            (x1 * x1 + y1 * y1) * (y2 - y3)
+            + (x2 * x2 + y2 * y2) * (y3 - y1)
+            + (x3 * x3 + y3 * y3) * (y1 - y2)
+        ) / d_px
+        uy_px = (
+            (x1 * x1 + y1 * y1) * (x3 - x2)
+            + (x2 * x2 + y2 * y2) * (x1 - x3)
+            + (x3 * x3 + y3 * y3) * (x2 - x1)
+        ) / d_px
+        radius_px = float(np.hypot(x1 - ux_px, y1 - uy_px))
+
+        # Compute radius in mm using scaled coordinates.
+        radius_mm = None
+        x1_mm, y1_mm = x1 * self.mm_per_px_x, y1 * self.mm_per_px_y
+        x2_mm, y2_mm = x2 * self.mm_per_px_x, y2 * self.mm_per_px_y
+        x3_mm, y3_mm = x3 * self.mm_per_px_x, y3 * self.mm_per_px_y
+        d_mm = 2.0 * (x1_mm * (y2_mm - y3_mm) + x2_mm * (y3_mm - y1_mm) + x3_mm * (y1_mm - y2_mm))
+        if abs(d_mm) >= 1e-9:
+            ux_mm = (
+                (x1_mm * x1_mm + y1_mm * y1_mm) * (y2_mm - y3_mm)
+                + (x2_mm * x2_mm + y2_mm * y2_mm) * (y3_mm - y1_mm)
+                + (x3_mm * x3_mm + y3_mm * y3_mm) * (y1_mm - y2_mm)
+            ) / d_mm
+            uy_mm = (
+                (x1_mm * x1_mm + y1_mm * y1_mm) * (x3_mm - x2_mm)
+                + (x2_mm * x2_mm + y2_mm * y2_mm) * (x1_mm - x3_mm)
+                + (x3_mm * x3_mm + y3_mm * y3_mm) * (x2_mm - x1_mm)
+            ) / d_mm
+            radius_mm = float(np.hypot(x1_mm - ux_mm, y1_mm - uy_mm))
+        return {
+            "center_px": (ux_px, uy_px),
+            "radius_px": radius_px,
+            "radius_mm": radius_mm,
+        }
+
+    def _update_measure_status(self):
+        label = getattr(self, "measure_status_label", None)
+        if not label:
+            return
+        mode = self._measure_active_mode
+        text = "Measurement: Idle. Pick Line or Arc."
+        if mode == "line":
+            if len(self._measure_line_points) == 0:
+                text = "Line: click first point."
+            elif len(self._measure_line_points) == 1:
+                text = "Line: click second point."
+            elif len(self._measure_line_points) == 2:
+                lengths = self._measure_line_lengths()
+                if lengths:
+                    px, mm = lengths
+                    text = f"Line length: {px:.1f} px ({mm:.3f} mm). Drag endpoints to adjust."
+        elif mode == "arc":
+            if len(self._measure_arc_points) == 0:
+                text = "Arc: click first point."
+            elif len(self._measure_arc_points) == 1:
+                text = "Arc: click second point."
+            elif len(self._measure_arc_points) == 2:
+                text = "Arc: click third point to define circle."
+            elif len(self._measure_arc_points) == 3:
+                geom = self._measure_arc_geometry()
+                if geom:
+                    radius_mm = geom["radius_mm"]
+                    mm_text = f"{radius_mm:.3f} mm" if radius_mm is not None else "mm: N/A"
+                    text = f"Arc radius: {geom['radius_px']:.1f} px ({mm_text}). Drag points to adjust."
+                else:
+                    text = "Arc: points are collinear; adjust positions."
+        else:
+            # Show last values if any even when idle
+            lengths = self._measure_line_lengths()
+            geom = self._measure_arc_geometry()
+            if lengths:
+                px, mm = lengths
+                text = f"Last line: {px:.1f} px ({mm:.3f} mm)."
+            elif geom:
+                radius_mm = geom["radius_mm"]
+                mm_text = f"{radius_mm:.3f} mm" if radius_mm is not None else "mm: N/A"
+                text = f"Last arc radius: {geom['radius_px']:.1f} px ({mm_text})."
         label.setText(text)
 
     def _update_histogram_window(self, payload: Optional[FramePayload]):
@@ -2228,6 +2476,113 @@ class CameraApp(QtWidgets.QMainWindow):
         self._line_drag_mode = None
         return True
 
+    def _start_measure_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if self._measure_active_mode != "line" or len(self._measure_line_points) != 2:
+            return False
+        pos = event.position()
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(pos.x() / scale, pos.y() / scale)
+        p1_screen = self._screen_point_for_line(self._measure_line_points[0])
+        p2_screen = self._screen_point_for_line(self._measure_line_points[1])
+        hit_radius = 16.0
+        dist_p1 = float(np.hypot(pos.x() - p1_screen.x(), pos.y() - p1_screen.y()))
+        dist_p2 = float(np.hypot(pos.x() - p2_screen.x(), pos.y() - p2_screen.y()))
+        mode = None
+        if dist_p1 <= hit_radius:
+            mode = "p1"
+        elif dist_p2 <= hit_radius:
+            mode = "p2"
+        else:
+            dist_seg = self._distance_to_segment(pos, p1_screen, p2_screen)
+            if dist_seg <= hit_radius:
+                mode = "move"
+        if mode:
+            self._measure_line_dragging = True
+            self._measure_line_drag_mode = mode
+            self._measure_line_drag_start = p_img
+            self._measure_line_drag_start_points = list(self._measure_line_points)
+            event.accept()
+            self._sync_panning_enabled()
+            return True
+        return False
+
+    def _update_measure_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._measure_line_dragging or self._measure_line_drag_mode is None:
+            return False
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(event.position().x() / scale, event.position().y() / scale)
+        if self._measure_line_drag_start is None or not self._measure_line_drag_start_points:
+            return False
+        dx = p_img.x() - self._measure_line_drag_start.x()
+        dy = p_img.y() - self._measure_line_drag_start.y()
+        if self._measure_line_drag_mode == "p1":
+            new_p1 = self._clamp_point(p_img.x(), p_img.y())
+            self._measure_line_points[0] = new_p1
+            self._measure_line_points[1] = self._measure_line_drag_start_points[1]
+        elif self._measure_line_drag_mode == "p2":
+            new_p2 = self._clamp_point(p_img.x(), p_img.y())
+            self._measure_line_points[1] = new_p2
+            self._measure_line_points[0] = self._measure_line_drag_start_points[0]
+        elif self._measure_line_drag_mode == "move":
+            start_p1, start_p2 = self._measure_line_drag_start_points
+            new_p1 = self._clamp_point(start_p1[0] + dx, start_p1[1] + dy)
+            new_p2 = self._clamp_point(start_p2[0] + dx, start_p2[1] + dy)
+            self._measure_line_points[0] = new_p1
+            self._measure_line_points[1] = new_p2
+        event.accept()
+        self._update_measure_status()
+        self._refresh_image_view()
+        return True
+
+    def _finish_measure_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._measure_line_dragging:
+            return False
+        self._measure_line_dragging = False
+        self._measure_line_drag_mode = None
+        self._measure_line_drag_start = None
+        self._measure_line_drag_start_points = []
+        self._update_measure_status()
+        self._sync_panning_enabled()
+        event.accept()
+        return True
+
+    def _start_measure_arc_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if self._measure_active_mode != "arc" or len(self._measure_arc_points) != 3:
+            return False
+        pos = event.position()
+        hit_radius = 16.0
+        for idx, pt in enumerate(self._measure_arc_points):
+            pt_screen = self._screen_point_for_line(pt)
+            dist = float(np.hypot(pos.x() - pt_screen.x(), pos.y() - pt_screen.y()))
+            if dist <= hit_radius:
+                self._measure_arc_dragging = True
+                self._measure_arc_drag_index = idx
+                self._sync_panning_enabled()
+                event.accept()
+                return True
+        return False
+
+    def _update_measure_arc_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._measure_arc_dragging or self._measure_arc_drag_index is None:
+            return False
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(event.position().x() / scale, event.position().y() / scale)
+        new_pt = self._clamp_point(p_img.x(), p_img.y())
+        self._measure_arc_points[self._measure_arc_drag_index] = new_pt
+        event.accept()
+        self._update_measure_status()
+        self._refresh_image_view()
+        return True
+
+    def _finish_measure_arc_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._measure_arc_dragging:
+            return False
+        self._measure_arc_dragging = False
+        self._measure_arc_drag_index = None
+        self._sync_panning_enabled()
+        event.accept()
+        return True
+
     def _sample_line_profile(self, p1: tuple[int, int], p2: tuple[int, int], min_samples: int = 20):
         if not self.last_payload:
             return None
@@ -2533,6 +2888,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 p1, p2, color = seg
                 img = self._draw_line_segment(img, [p1, p2], color=(color.red(), color.green(), color.blue()))
         img = self._draw_calibration_overlay(img)
+        img = self._draw_measure_overlay(img)
         img = self._draw_exposure_gain_overlay(img)
         return img
 
@@ -2595,10 +2951,72 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _draw_calibration_overlay(self, image: Image.Image) -> Image.Image:
         axis = self._calibration_axis or self._calibration_last_axis
-        if len(self._calibration_points) != 2 or axis not in ("x", "y"):
+        if len(self._calibration_points) != 2 or axis not in ("x", "y", "both"):
             return image
         color = (0, 200, 255)
         return self._draw_line_segment(image, self._calibration_points, color=color)
+
+    def _draw_measure_overlay(self, image: Image.Image) -> Image.Image:
+        img = image
+        # Line overlay
+        if len(self._measure_line_points) == 2:
+            img = self._draw_line_segment(img, self._measure_line_points, color=(120, 255, 120))
+            lengths = self._measure_line_lengths()
+            if lengths:
+                px_len, mm_len = lengths
+                mid_x = (self._measure_line_points[0][0] + self._measure_line_points[1][0]) / 2.0
+                mid_y = (self._measure_line_points[0][1] + self._measure_line_points[1][1]) / 2.0
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                draw = ImageDraw.Draw(img)
+                font = self._get_overlay_font(16)
+                text = f"{px_len:.1f}px / {mm_len:.3f}mm"
+                try:
+                    bbox = draw.textbbox((0, 0), text, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                except Exception:
+                    text_w, text_h = font.getsize(text) if font else (len(text) * 8, 16)
+                x = int(mid_x + 8)
+                y = int(mid_y - text_h - 4)
+                x = max(0, min(img.width - text_w - 4, x))
+                y = max(0, min(img.height - text_h - 4, y))
+                draw.rectangle((x - 2, y - 2, x + text_w + 2, y + text_h + 2), fill=(0, 0, 0, 150))
+                draw.text((x, y), text, fill=(120, 255, 120), font=font)
+
+        # Arc overlay
+        if len(self._measure_arc_points) == 3:
+            geom = self._measure_arc_geometry()
+            if geom:
+                cx, cy = geom["center_px"]
+                r_px = geom["radius_px"]
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                draw = ImageDraw.Draw(img)
+                bbox = (cx - r_px, cy - r_px, cx + r_px, cy + r_px)
+                draw.ellipse(bbox, outline=(255, 160, 0), width=2)
+                # Points and chords for clarity
+                for pt in self._measure_arc_points:
+                    x, y = pt
+                    draw.ellipse((x - 4, y - 4, x + 4, y + 4), outline=(255, 160, 0), width=2)
+                draw.line(self._measure_arc_points + [self._measure_arc_points[0]], fill=(200, 120, 0), width=1)
+                radius_mm = geom.get("radius_mm")
+                mm_text = f"{radius_mm:.3f}mm" if radius_mm is not None else "mm:N/A"
+                text = f"r={geom['radius_px']:.1f}px / {mm_text}"
+                font = self._get_overlay_font(16)
+                try:
+                    tbbox = draw.textbbox((0, 0), text, font=font)
+                    text_w = tbbox[2] - tbbox[0]
+                    text_h = tbbox[3] - tbbox[1]
+                except Exception:
+                    text_w, text_h = font.getsize(text) if font else (len(text) * 8, 16)
+                x = int(cx + r_px + 6)
+                y = int(cy - text_h - 4)
+                x = max(0, min(img.width - text_w - 4, x))
+                y = max(0, min(img.height - text_h - 4, y))
+                draw.rectangle((x - 2, y - 2, x + text_w + 2, y + text_h + 2), fill=(0, 0, 0, 150))
+                draw.text((x, y), text, fill=(255, 200, 0), font=font)
+        return img
 
     def _get_overlay_font(self, size: int = 18):
         if not hasattr(self, "_cached_overlay_font") or self._cached_overlay_font is None:
@@ -3219,6 +3637,35 @@ class CameraApp(QtWidgets.QMainWindow):
             if handled:
                 return True
 
+            measure_line_ready = (
+                self._measure_active_mode == "line"
+                and len(self._measure_line_points) == 2
+                and (getattr(self, "measure_checkbox", None) is None or self.measure_checkbox.isChecked())
+            )
+            measure_arc_ready = (
+                self._measure_active_mode == "arc"
+                and len(self._measure_arc_points) == 3
+                and (getattr(self, "measure_checkbox", None) is None or self.measure_checkbox.isChecked())
+            )
+            if measure_line_ready:
+                if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                    handled = self._start_measure_line_drag(event)
+                elif event.type() == QtCore.QEvent.Type.MouseMove:
+                    handled = self._update_measure_line_drag(event)
+                elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                    handled = self._finish_measure_line_drag(event)
+                if handled:
+                    return True
+            elif measure_arc_ready:
+                if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                    handled = self._start_measure_arc_drag(event)
+                elif event.type() == QtCore.QEvent.Type.MouseMove:
+                    handled = self._update_measure_arc_drag(event)
+                elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                    handled = self._finish_measure_arc_drag(event)
+                if handled:
+                    return True
+
             if len(self._line_points) == 2:
                 if event.type() == QtCore.QEvent.Type.MouseButtonPress:
                     if self._start_line_drag(event):
@@ -3396,7 +3843,13 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _sync_panning_enabled(self):
         if getattr(self, "image_label", None):
-            allow_pan = not self._fit_to_window and not self._line_edit_mode and not self._calibration_dragging
+            allow_pan = (
+                not self._fit_to_window
+                and not self._line_edit_mode
+                and not self._calibration_dragging
+                and not self._measure_line_dragging
+                and not self._measure_arc_dragging
+            )
             self.image_label.set_panning_enabled(allow_pan)
 
     def _reset_pan(self):
@@ -3538,6 +3991,22 @@ class CameraApp(QtWidgets.QMainWindow):
                 self._calibration_points.append((src_x, src_y))
                 self._calibration_last_axis = self._calibration_axis
                 self._update_calibration_status()
+                self._refresh_image_view()
+            return
+        if self._measure_active_mode == "line":
+            if 0 <= src_x < w and 0 <= src_y < h:
+                self._measure_line_points.append((src_x, src_y))
+                if len(self._measure_line_points) > 2:
+                    self._measure_line_points = self._measure_line_points[:2]
+                self._update_measure_status()
+                self._refresh_image_view()
+            return
+        if self._measure_active_mode == "arc":
+            if 0 <= src_x < w and 0 <= src_y < h:
+                self._measure_arc_points.append((src_x, src_y))
+                if len(self._measure_arc_points) > 3:
+                    self._measure_arc_points = self._measure_arc_points[:3]
+                self._update_measure_status()
                 self._refresh_image_view()
             return
         if self._line_select_mode:
