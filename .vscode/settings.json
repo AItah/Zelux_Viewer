@@ -1,0 +1,18 @@
+{
+    "python.pythonPath": "${workspaceFolder}/venv/bin/python", // or path to your virtual environment or python interpreter
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}"
+    ],
+    "workbench.colorCustomizations": {
+        "editorBracketHighlight.foreground1": "#d000d0",
+        "editorBracketHighlight.foreground2": "#ffa500",
+        "editorBracketHighlight.foreground3": "#009999",
+        "editorBracketHighlight.foreground4": "#dd0000",
+        "editorBracketHighlight.foreground5": "#00aa00",
+        "editorBracketHighlight.foreground6": "#0000dd",
+    },
+    "editor.bracketPairColorization.enabled": true,
+
+    "editor.guides.bracketPairs": "active"
+
+}

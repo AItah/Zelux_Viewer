@@ -616,6 +616,30 @@ class CameraApp(QtWidgets.QMainWindow):
         self._measure_arc_points: list[tuple[int, int]] = []
         self._measure_arc_dragging = False
         self._measure_arc_drag_index: Optional[int] = None
+        self._measure_line_text_offset: tuple[float, float] = (0.0, 0.0)
+        self._measure_arc_text_offset: tuple[float, float] = (0.0, 0.0)
+        self._measure_line_text_rect: Optional[tuple[float, float, float, float]] = None
+        self._measure_arc_text_rect: Optional[tuple[float, float, float, float]] = None
+        self._measure_text_dragging = False
+        self._measure_text_drag_target: Optional[str] = None
+        self._measure_text_drag_start: Optional[QtCore.QPointF] = None
+        self._ref_active_mode: Optional[str] = None  # "line" or "arc" while drawing references
+        self._ref_temp_points: list[tuple[int, int]] = []
+        self._ref_lines: list[dict] = []  # each: {"points": [(x1,y1),(x2,y2)]}
+        self._ref_arcs: list[dict] = []  # each: {"points": [(x1,y1),(x2,y2),(x3,y3)]}
+        self._ref_line_dragging = False
+        self._ref_line_drag_mode: Optional[str] = None
+        self._ref_line_drag_start: Optional[QtCore.QPointF] = None
+        self._ref_line_drag_start_points: Optional[list[tuple[int, int]]] = None
+        self._ref_line_drag_index: Optional[int] = None
+        self._ref_arc_dragging = False
+        self._ref_arc_drag_index: Optional[int] = None
+        self._mirror_x = False
+        self._mirror_y = False
+        self._rotate_deg = 0.0
+        self._filtered_np_image_untransformed: Optional[np.ndarray] = None
+        self._raw_display_np_image: Optional[np.ndarray] = None
+        self._display_np_image: Optional[np.ndarray] = None
         self._in_hist_update = False
         self._line_select_mode = False
         self._line_points: list[tuple[int, int]] = []
@@ -895,6 +919,19 @@ class CameraApp(QtWidgets.QMainWindow):
         measure_row.addStretch(1)
         layout.addLayout(measure_row)
 
+        ref_row = QtWidgets.QHBoxLayout()
+        self.ref_line_btn = QtWidgets.QPushButton("Ref Line")
+        self.ref_line_btn.clicked.connect(self._start_ref_line)
+        ref_row.addWidget(self.ref_line_btn)
+        self.ref_arc_btn = QtWidgets.QPushButton("Ref Arc")
+        self.ref_arc_btn.clicked.connect(self._start_ref_arc)
+        ref_row.addWidget(self.ref_arc_btn)
+        self.ref_clear_btn = QtWidgets.QPushButton("Clear Refs")
+        self.ref_clear_btn.clicked.connect(self._clear_references)
+        ref_row.addWidget(self.ref_clear_btn)
+        ref_row.addStretch(1)
+        layout.addLayout(ref_row)
+
         self.measure_status_label = QtWidgets.QLabel("Measurement: Idle. Pick Line or Arc.")
         self.measure_status_label.setWordWrap(True)
         layout.addWidget(self.measure_status_label)
@@ -1095,6 +1132,25 @@ class CameraApp(QtWidgets.QMainWindow):
         self.mm_px_y_spin.setMaximumWidth(140)
         self.mm_px_y_spin.valueChanged.connect(lambda v: self._update_mm_scale(v, axis="y"))
         grid.addWidget(self.mm_px_y_spin, 4, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Mirror X (flip vertically)"), 5, 0)
+        self.mirror_x_checkbox = QtWidgets.QCheckBox()
+        self.mirror_x_checkbox.stateChanged.connect(self._toggle_mirror_x)
+        grid.addWidget(self.mirror_x_checkbox, 5, 1)
+
+        grid.addWidget(QtWidgets.QLabel("Mirror Y (flip horizontally)"), 5, 2)
+        self.mirror_y_checkbox = QtWidgets.QCheckBox()
+        self.mirror_y_checkbox.stateChanged.connect(self._toggle_mirror_y)
+        grid.addWidget(self.mirror_y_checkbox, 5, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Rotate (deg)"), 6, 0)
+        self.rotate_spin = QtWidgets.QDoubleSpinBox()
+        self.rotate_spin.setRange(-360.0, 360.0)
+        self.rotate_spin.setDecimals(2)
+        self.rotate_spin.setSingleStep(1.0)
+        self.rotate_spin.setValue(self._rotate_deg)
+        self.rotate_spin.valueChanged.connect(self._set_rotation_deg)
+        grid.addWidget(self.rotate_spin, 6, 1)
 
         return group
 
@@ -1544,6 +1600,32 @@ class CameraApp(QtWidgets.QMainWindow):
         self._update_measure_status()
         # refresh hover text if desired; no explicit refresh needed for display
 
+    def _toggle_mirror_x(self, state: int):
+        try:
+            checked = QtCore.Qt.CheckState(state) == QtCore.Qt.CheckState.Checked
+        except Exception:
+            checked = bool(state)
+        self._mirror_x = checked
+        self._rebuild_view_transforms()
+        self._refresh_image_view()
+
+    def _toggle_mirror_y(self, state: int):
+        try:
+            checked = QtCore.Qt.CheckState(state) == QtCore.Qt.CheckState.Checked
+        except Exception:
+            checked = bool(state)
+        self._mirror_y = checked
+        self._rebuild_view_transforms()
+        self._refresh_image_view()
+
+    def _set_rotation_deg(self, value: float):
+        try:
+            self._rotate_deg = float(value)
+        except Exception:
+            self._rotate_deg = 0.0
+        self._rebuild_view_transforms()
+        self._refresh_image_view()
+
     def _poll_queue(self):
         if self.acq_thread:
             q = self.acq_thread.get_queue()
@@ -1633,7 +1715,8 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _display_frame(self, payload: FramePayload):
         self.last_payload = payload
-        self._filtered_np_image = self._apply_image_filter_np(payload.np_image)
+        self._filtered_np_image_untransformed = self._apply_image_filter_np(payload.np_image)
+        self._rebuild_view_transforms()
         self._refresh_image_view()
 
     def _refresh_image_view(self):
@@ -1970,6 +2053,15 @@ class CameraApp(QtWidgets.QMainWindow):
         self._measure_arc_points = []
         self._measure_arc_dragging = False
         self._measure_arc_drag_index = None
+        self._measure_line_text_offset = (0.0, 0.0)
+        self._measure_arc_text_offset = (0.0, 0.0)
+        self._measure_line_text_rect = None
+        self._measure_arc_text_rect = None
+        self._measure_text_dragging = False
+        self._measure_text_drag_target = None
+        self._measure_text_drag_start = None
+        self._ref_active_mode = None
+        self._ref_temp_points = []
         self._calibration_axis = None  # avoid eating clicks
         self._line_select_mode = False
         self._line_edit_mode = False
@@ -1993,6 +2085,15 @@ class CameraApp(QtWidgets.QMainWindow):
         self._measure_line_drag_mode = None
         self._measure_line_drag_start = None
         self._measure_line_drag_start_points = []
+        self._measure_line_text_offset = (0.0, 0.0)
+        self._measure_arc_text_offset = (0.0, 0.0)
+        self._measure_line_text_rect = None
+        self._measure_arc_text_rect = None
+        self._measure_text_dragging = False
+        self._measure_text_drag_target = None
+        self._measure_text_drag_start = None
+        self._ref_active_mode = None
+        self._ref_temp_points = []
         self._calibration_axis = None
         self._line_select_mode = False
         self._line_edit_mode = False
@@ -2011,24 +2112,35 @@ class CameraApp(QtWidgets.QMainWindow):
         self._measure_arc_points = []
         self._measure_arc_dragging = False
         self._measure_arc_drag_index = None
+        self._measure_line_text_offset = (0.0, 0.0)
+        self._measure_arc_text_offset = (0.0, 0.0)
+        self._measure_line_text_rect = None
+        self._measure_arc_text_rect = None
+        self._measure_text_dragging = False
+        self._measure_text_drag_target = None
+        self._measure_text_drag_start = None
+        self._ref_active_mode = None
+        self._ref_temp_points = []
         self._update_measure_status()
         self._sync_panning_enabled()
         self._refresh_image_view()
 
-    def _measure_line_lengths(self) -> Optional[tuple[float, float]]:
-        if len(self._measure_line_points) != 2:
+    def _measure_line_lengths(self, points: Optional[list[tuple[int, int]]] = None) -> Optional[tuple[float, float]]:
+        pts = points if points is not None else self._measure_line_points
+        if len(pts) != 2:
             return None
-        p1, p2 = self._measure_line_points
+        p1, p2 = pts
         dx_px = float(p2[0] - p1[0])
         dy_px = float(p2[1] - p1[1])
         length_px = float(np.hypot(dx_px, dy_px))
         length_mm = float(np.hypot(dx_px * self.mm_per_px_x, dy_px * self.mm_per_px_y))
         return length_px, length_mm
 
-    def _measure_arc_geometry(self) -> Optional[dict]:
-        if len(self._measure_arc_points) != 3:
+    def _measure_arc_geometry(self, points: Optional[list[tuple[int, int]]] = None) -> Optional[dict]:
+        pts = points if points is not None else self._measure_arc_points
+        if len(pts) != 3:
             return None
-        (x1, y1), (x2, y2), (x3, y3) = [tuple(map(float, pt)) for pt in self._measure_arc_points]
+        (x1, y1), (x2, y2), (x3, y3) = [tuple(map(float, pt)) for pt in pts]
         d_px = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
         if abs(d_px) < 1e-6:
             return None
@@ -2110,7 +2222,22 @@ class CameraApp(QtWidgets.QMainWindow):
                 radius_mm = geom["radius_mm"]
                 mm_text = f"{radius_mm:.3f} mm" if radius_mm is not None else "mm: N/A"
                 text = f"Last arc radius: {geom['radius_px']:.1f} px ({mm_text})."
-        label.setText(text)
+        ref_text = ""
+        if self._ref_active_mode == "line":
+            if len(self._ref_temp_points) == 0:
+                ref_text = " | Ref line: click first point."
+            elif len(self._ref_temp_points) == 1:
+                ref_text = " | Ref line: click second point."
+        elif self._ref_active_mode == "arc":
+            if len(self._ref_temp_points) == 0:
+                ref_text = " | Ref arc: click first point."
+            elif len(self._ref_temp_points) == 1:
+                ref_text = " | Ref arc: click second point."
+            elif len(self._ref_temp_points) == 2:
+                ref_text = " | Ref arc: click third point."
+        if self._ref_lines or self._ref_arcs:
+            ref_text += f" | Refs: {len(self._ref_lines)} line(s), {len(self._ref_arcs)} arc(s)."
+        label.setText(text + ref_text)
 
     def _update_histogram_window(self, payload: Optional[FramePayload]):
         if not getattr(self, "hist_window", None):
@@ -2143,7 +2270,9 @@ class CameraApp(QtWidgets.QMainWindow):
             self._in_hist_update = False
 
     def _build_histogram_pixmap(self, payload: FramePayload) -> QtGui.QPixmap:
-        data = self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
+        data = self._display_np_image if self._display_np_image is not None else (
+            self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
+        )
         if data.ndim == 3:
             if self._force_grayscale:
                 data = np.mean(data, axis=2)
@@ -2583,11 +2712,235 @@ class CameraApp(QtWidgets.QMainWindow):
         event.accept()
         return True
 
+    def _start_ref_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._ref_lines:
+            return False
+        pos = event.position()
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(pos.x() / scale, pos.y() / scale)
+        hit_radius = 14.0
+        # Iterate in reverse so last drawn gets priority
+        for idx in reversed(range(len(self._ref_lines))):
+            pts = self._ref_lines[idx].get("points", [])
+            if len(pts) != 2:
+                continue
+            p1_screen = self._screen_point_for_line(pts[0])
+            p2_screen = self._screen_point_for_line(pts[1])
+            dist_p1 = float(np.hypot(pos.x() - p1_screen.x(), pos.y() - p1_screen.y()))
+            dist_p2 = float(np.hypot(pos.x() - p2_screen.x(), pos.y() - p2_screen.y()))
+            mode = None
+            if dist_p1 <= hit_radius:
+                mode = "p1"
+            elif dist_p2 <= hit_radius:
+                mode = "p2"
+            else:
+                dist_seg = self._distance_to_segment(pos, p1_screen, p2_screen)
+                if dist_seg <= hit_radius:
+                    mode = "move"
+            if mode:
+                self._ref_line_dragging = True
+                self._ref_line_drag_mode = mode
+                self._ref_line_drag_start = p_img
+                self._ref_line_drag_start_points = list(pts)
+                self._ref_line_drag_index = idx
+                event.accept()
+                self._sync_panning_enabled()
+                return True
+        return False
+
+    def _update_ref_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._ref_line_dragging or self._ref_line_drag_mode is None or self._ref_line_drag_index is None:
+            return False
+        if self._ref_line_drag_start is None or self._ref_line_drag_start_points is None:
+            return False
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(event.position().x() / scale, event.position().y() / scale)
+        dx = p_img.x() - self._ref_line_drag_start.x()
+        dy = p_img.y() - self._ref_line_drag_start.y()
+        pts = list(self._ref_line_drag_start_points)
+        if self._ref_line_drag_mode == "p1":
+            pts[0] = self._clamp_point(p_img.x(), p_img.y())
+            pts[1] = self._ref_line_drag_start_points[1]
+        elif self._ref_line_drag_mode == "p2":
+            pts[1] = self._clamp_point(p_img.x(), p_img.y())
+            pts[0] = self._ref_line_drag_start_points[0]
+        elif self._ref_line_drag_mode == "move":
+            pts[0] = self._clamp_point(self._ref_line_drag_start_points[0][0] + dx, self._ref_line_drag_start_points[0][1] + dy)
+            pts[1] = self._clamp_point(self._ref_line_drag_start_points[1][0] + dx, self._ref_line_drag_start_points[1][1] + dy)
+        self._ref_lines[self._ref_line_drag_index]["points"] = pts
+        self._ref_line_drag_start = p_img
+        event.accept()
+        self._update_measure_status()
+        self._refresh_image_view()
+        return True
+
+    def _finish_ref_line_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._ref_line_dragging:
+            return False
+        self._ref_line_dragging = False
+        self._ref_line_drag_mode = None
+        self._ref_line_drag_start = None
+        self._ref_line_drag_start_points = None
+        self._ref_line_drag_index = None
+        self._sync_panning_enabled()
+        event.accept()
+        return True
+
+    def _start_ref_arc_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._ref_arcs:
+            return False
+        pos = event.position()
+        hit_radius = 14.0
+        for idx in reversed(range(len(self._ref_arcs))):
+            pts = self._ref_arcs[idx].get("points", [])
+            if len(pts) != 3:
+                continue
+            for p_idx, pt in enumerate(pts):
+                pt_screen = self._screen_point_for_line(pt)
+                dist = float(np.hypot(pos.x() - pt_screen.x(), pos.y() - pt_screen.y()))
+                if dist <= hit_radius:
+                    self._ref_arc_dragging = True
+                    self._ref_arc_drag_index = (idx, p_idx)
+                    self._sync_panning_enabled()
+                    event.accept()
+                    return True
+        return False
+
+    def _update_ref_arc_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._ref_arc_dragging or self._ref_arc_drag_index is None:
+            return False
+        idx, p_idx = self._ref_arc_drag_index
+        if idx < 0 or idx >= len(self._ref_arcs):
+            return False
+        scale = self._last_render_scale or 1.0
+        p_img = QtCore.QPointF(event.position().x() / scale, event.position().y() / scale)
+        new_pt = self._clamp_point(p_img.x(), p_img.y())
+        pts = list(self._ref_arcs[idx].get("points", []))
+        if len(pts) != 3:
+            return False
+        pts[p_idx] = new_pt
+        self._ref_arcs[idx]["points"] = pts
+        event.accept()
+        self._update_measure_status()
+        self._refresh_image_view()
+        return True
+
+    def _finish_ref_arc_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._ref_arc_dragging:
+            return False
+        self._ref_arc_dragging = False
+        self._ref_arc_drag_index = None
+        self._sync_panning_enabled()
+        event.accept()
+        return True
+
+    def _start_ref_line(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "No image", "Capture or start live view before adding references.")
+            return
+        if getattr(self, "measure_checkbox", None):
+            self.measure_checkbox.setChecked(True)
+        self._ref_active_mode = "line"
+        self._ref_temp_points = []
+        self._ref_line_dragging = False
+        self._ref_line_drag_mode = None
+        self._ref_line_drag_start = None
+        self._ref_line_drag_start_points = None
+        self._ref_line_drag_index = None
+        self._update_measure_status()
+        self._refresh_image_view()
+
+    def _start_ref_arc(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "No image", "Capture or start live view before adding references.")
+            return
+        if getattr(self, "measure_checkbox", None):
+            self.measure_checkbox.setChecked(True)
+        self._ref_active_mode = "arc"
+        self._ref_temp_points = []
+        self._ref_arc_dragging = False
+        self._ref_arc_drag_index = None
+        self._update_measure_status()
+        self._refresh_image_view()
+
+    def _clear_references(self):
+        self._ref_active_mode = None
+        self._ref_temp_points = []
+        self._ref_lines = []
+        self._ref_arcs = []
+        self._ref_line_dragging = False
+        self._ref_line_drag_mode = None
+        self._ref_line_drag_start = None
+        self._ref_line_drag_start_points = None
+        self._ref_line_drag_index = None
+        self._ref_arc_dragging = False
+        self._ref_arc_drag_index = None
+        self._update_measure_status()
+        self._refresh_image_view()
+
+    def _start_measure_text_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not (self._measure_line_text_rect or self._measure_arc_text_rect):
+            return False
+        scale = self._last_render_scale or 1.0
+        pos = event.position()
+        pos_img = QtCore.QPointF(pos.x() / scale, pos.y() / scale)
+        padding = 6.0
+
+        def _hit(rect: tuple[float, float, float, float]) -> bool:
+            x, y, w, h = rect
+            return (x - padding) <= pos_img.x() <= (x + w + padding) and (y - padding) <= pos_img.y() <= (y + h + padding)
+
+        if self._measure_line_text_rect and _hit(self._measure_line_text_rect):
+            self._measure_text_dragging = True
+            self._measure_text_drag_target = "line"
+            self._measure_text_drag_start = pos_img
+            self._sync_panning_enabled()
+            event.accept()
+            return True
+        if self._measure_arc_text_rect and _hit(self._measure_arc_text_rect):
+            self._measure_text_dragging = True
+            self._measure_text_drag_target = "arc"
+            self._measure_text_drag_start = pos_img
+            self._sync_panning_enabled()
+            event.accept()
+            return True
+        return False
+
+    def _update_measure_text_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._measure_text_dragging or self._measure_text_drag_target is None:
+            return False
+        scale = self._last_render_scale or 1.0
+        pos_img = QtCore.QPointF(event.position().x() / scale, event.position().y() / scale)
+        if self._measure_text_drag_start is None:
+            return False
+        dx = pos_img.x() - self._measure_text_drag_start.x()
+        dy = pos_img.y() - self._measure_text_drag_start.y()
+        if self._measure_text_drag_target == "line":
+            ox, oy = self._measure_line_text_offset
+            self._measure_line_text_offset = (ox + dx, oy + dy)
+        elif self._measure_text_drag_target == "arc":
+            ox, oy = self._measure_arc_text_offset
+            self._measure_arc_text_offset = (ox + dx, oy + dy)
+        self._measure_text_drag_start = pos_img
+        self._refresh_image_view()
+        event.accept()
+        return True
+
+    def _finish_measure_text_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._measure_text_dragging:
+            return False
+        self._measure_text_dragging = False
+        self._measure_text_drag_target = None
+        self._measure_text_drag_start = None
+        self._sync_panning_enabled()
+        event.accept()
+        return True
+
     def _sample_line_profile(self, p1: tuple[int, int], p2: tuple[int, int], min_samples: int = 20):
         if not self.last_payload:
             return None
-        raw_data = self.last_payload.np_image
-        filtered_data = self._filtered_np_image if self._filtered_np_image is not None else raw_data
+        raw_data = self._raw_display_np_image if self._raw_display_np_image is not None else self.last_payload.np_image
+        filtered_data = self._display_np_image if self._display_np_image is not None else raw_data
         if raw_data.ndim == 3:
             raw_data = np.mean(raw_data, axis=2)
         if filtered_data.ndim == 3:
@@ -2817,6 +3170,56 @@ class CameraApp(QtWidgets.QMainWindow):
             filtered = np.asarray(filtered, dtype=data.dtype)
         return filtered
 
+    def _apply_view_transform_np(self, data: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Apply mirror/rotation for display and interaction coordinates."""
+        if data is None:
+            return None
+        arr = np.asarray(data)
+        if arr.ndim not in (2, 3):
+            return arr
+        result = arr
+        if self._mirror_y:
+            result = np.fliplr(result)
+        if self._mirror_x:
+            result = np.flipud(result)
+
+        angle = float(self._rotate_deg)
+        if abs(angle) < 1e-6:
+            return result
+
+        # Fast path for right angles
+        right_angles = {0, 90, 180, 270, -90, -180, -270, 360, -360}
+        if int(round(angle)) in right_angles:
+            k = (int(round(angle)) // 90) % 4
+            return np.rot90(result, k=-k)  # negative to match PIL direction
+
+        # Arbitrary angle: use PIL with padding to keep full content.
+        pil_mode = "RGB" if (result.ndim == 3 and result.shape[2] >= 3) else "L"
+        rot_src = result
+        if rot_src.dtype.kind == "f":
+            rot_src = np.clip(rot_src, 0.0, 255.0).astype(np.float32)
+        try:
+            pil_img = Image.fromarray(rot_src.astype(np.uint8) if rot_src.dtype != np.uint8 else rot_src, mode=pil_mode)
+        except Exception:
+            pil_img = Image.fromarray(np.clip(rot_src, 0, 255).astype(np.uint8), mode=pil_mode)
+        rotated = pil_img.rotate(-angle, expand=True, resample=Image.Resampling.BICUBIC, fillcolor=0)
+        result_arr = np.array(rotated)
+        if pil_mode == "L" and result.ndim == 2:
+            return result_arr
+        if pil_mode == "L" and result.ndim == 3:
+            return np.stack([result_arr] * result.shape[2], axis=2)
+        return result_arr
+
+    def _rebuild_view_transforms(self):
+        """Recompute mirrored/rotated images from the latest frame and filtered copy."""
+        if not self.last_payload:
+            return
+        raw_np = self.last_payload.np_image
+        filtered = self._filtered_np_image_untransformed
+        self._raw_display_np_image = self._apply_view_transform_np(raw_np)
+        self._filtered_np_image = self._apply_view_transform_np(filtered) if filtered is not None else None
+        self._display_np_image = self._filtered_np_image if self._filtered_np_image is not None else self._raw_display_np_image
+
     def _sync_filter_controls(self):
         mode_text = self.filter_mode_combo.currentText() if getattr(self, "filter_mode_combo", None) else "None"
         if getattr(self, "filter_low_spin", None):
@@ -2827,7 +3230,8 @@ class CameraApp(QtWidgets.QMainWindow):
     def _on_filter_changed(self, *args):
         self._sync_filter_controls()
         if self.last_payload:
-            self._filtered_np_image = self._apply_image_filter_np(self.last_payload.np_image)
+            self._filtered_np_image_untransformed = self._apply_image_filter_np(self.last_payload.np_image)
+            self._rebuild_view_transforms()
             self._refresh_image_view()
         if len(self._line_points) == 2:
             # Re-run line fit with new filter for immediate visual feedback (without exporting multiple copies)
@@ -2875,7 +3279,9 @@ class CameraApp(QtWidgets.QMainWindow):
         raise ValueError("Unsupported array shape for conversion to PIL")
 
     def _prepare_display_image(self, payload: FramePayload) -> Image.Image:
-        base_np = self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
+        base_np = self._display_np_image
+        if base_np is None:
+            base_np = self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
         if self._force_grayscale and base_np.ndim == 3:
             base_np = np.mean(base_np, axis=2)
         img = self._np_to_pil_image(base_np)
@@ -2889,6 +3295,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 img = self._draw_line_segment(img, [p1, p2], color=(color.red(), color.green(), color.blue()))
         img = self._draw_calibration_overlay(img)
         img = self._draw_measure_overlay(img)
+        img = self._draw_reference_overlay(img)
         img = self._draw_exposure_gain_overlay(img)
         return img
 
@@ -2958,6 +3365,8 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _draw_measure_overlay(self, image: Image.Image) -> Image.Image:
         img = image
+        self._measure_line_text_rect = None
+        self._measure_arc_text_rect = None
         # Line overlay
         if len(self._measure_line_points) == 2:
             img = self._draw_line_segment(img, self._measure_line_points, color=(120, 255, 120))
@@ -2966,23 +3375,29 @@ class CameraApp(QtWidgets.QMainWindow):
                 px_len, mm_len = lengths
                 mid_x = (self._measure_line_points[0][0] + self._measure_line_points[1][0]) / 2.0
                 mid_y = (self._measure_line_points[0][1] + self._measure_line_points[1][1]) / 2.0
+                off_x, off_y = self._measure_line_text_offset
+                mid_x += off_x
+                mid_y += off_y
                 if img.mode != "RGB":
                     img = img.convert("RGB")
                 draw = ImageDraw.Draw(img)
-                font = self._get_overlay_font(16)
+                font_size = 20
+                font = self._get_overlay_font(font_size)
                 text = f"{px_len:.1f}px / {mm_len:.3f}mm"
                 try:
                     bbox = draw.textbbox((0, 0), text, font=font)
                     text_w = bbox[2] - bbox[0]
                     text_h = bbox[3] - bbox[1]
                 except Exception:
-                    text_w, text_h = font.getsize(text) if font else (len(text) * 8, 16)
-                x = int(mid_x + 8)
-                y = int(mid_y - text_h - 4)
+                    text_w, text_h = font.getsize(text) if font else (len(text) * 8, font_size)
+                x = int(mid_x + 10)
+                y = int(mid_y - text_h - 6)
                 x = max(0, min(img.width - text_w - 4, x))
                 y = max(0, min(img.height - text_h - 4, y))
-                draw.rectangle((x - 2, y - 2, x + text_w + 2, y + text_h + 2), fill=(0, 0, 0, 150))
+                padding = 4
+                draw.rectangle((x - padding, y - padding, x + text_w + padding, y + text_h + padding), fill=(0, 0, 0, 160))
                 draw.text((x, y), text, fill=(120, 255, 120), font=font)
+                self._measure_line_text_rect = (float(x), float(y), float(text_w), float(text_h))
 
         # Arc overlay
         if len(self._measure_arc_points) == 3:
@@ -3003,33 +3418,106 @@ class CameraApp(QtWidgets.QMainWindow):
                 radius_mm = geom.get("radius_mm")
                 mm_text = f"{radius_mm:.3f}mm" if radius_mm is not None else "mm:N/A"
                 text = f"r={geom['radius_px']:.1f}px / {mm_text}"
-                font = self._get_overlay_font(16)
+                font_size = 20
+                font = self._get_overlay_font(font_size)
                 try:
                     tbbox = draw.textbbox((0, 0), text, font=font)
                     text_w = tbbox[2] - tbbox[0]
                     text_h = tbbox[3] - tbbox[1]
                 except Exception:
-                    text_w, text_h = font.getsize(text) if font else (len(text) * 8, 16)
-                x = int(cx + r_px + 6)
-                y = int(cy - text_h - 4)
+                    text_w, text_h = font.getsize(text) if font else (len(text) * 8, font_size)
+                off_x, off_y = self._measure_arc_text_offset
+                cx_off = cx + off_x
+                cy_off = cy + off_y
+                x = int(cx_off + r_px + 8)
+                y = int(cy_off - text_h - 6)
                 x = max(0, min(img.width - text_w - 4, x))
                 y = max(0, min(img.height - text_h - 4, y))
-                draw.rectangle((x - 2, y - 2, x + text_w + 2, y + text_h + 2), fill=(0, 0, 0, 150))
+                padding = 4
+                draw.rectangle((x - padding, y - padding, x + text_w + padding, y + text_h + padding), fill=(0, 0, 0, 160))
                 draw.text((x, y), text, fill=(255, 200, 0), font=font)
+                self._measure_arc_text_rect = (float(x), float(y), float(text_w), float(text_h))
+        return img
+
+    def _draw_reference_overlay(self, image: Image.Image) -> Image.Image:
+        img = image
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        draw = ImageDraw.Draw(img)
+        font = self._get_overlay_font(18)
+
+        for ref in self._ref_lines:
+            pts = ref.get("points", [])
+            if len(pts) != 2:
+                continue
+            img = self._draw_line_segment(img, pts, color=(80, 180, 255))
+            lengths = self._measure_line_lengths(points=pts)
+            if not lengths:
+                continue
+            px_len, mm_len = lengths
+            mid_x = (pts[0][0] + pts[1][0]) / 2.0
+            mid_y = (pts[0][1] + pts[1][1]) / 2.0
+            text = f"{px_len:.1f}px / {mm_len:.3f}mm"
+            try:
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            except Exception:
+                text_w, text_h = font.getsize(text) if font else (len(text) * 8, 18)
+            x = int(mid_x + 6)
+            y = int(mid_y - text_h - 4)
+            x = max(0, min(img.width - text_w - 4, x))
+            y = max(0, min(img.height - text_h - 4, y))
+            draw.rectangle((x - 3, y - 3, x + text_w + 3, y + text_h + 3), fill=(0, 0, 0, 150))
+            draw.text((x, y), text, fill=(80, 200, 255), font=font)
+
+        for ref in self._ref_arcs:
+            pts = ref.get("points", [])
+            if len(pts) != 3:
+                continue
+            geom = self._measure_arc_geometry(points=pts)
+            if not geom:
+                continue
+            cx, cy = geom["center_px"]
+            r_px = geom["radius_px"]
+            bbox = (cx - r_px, cy - r_px, cx + r_px, cy + r_px)
+            draw.ellipse(bbox, outline=(200, 120, 255), width=2)
+            for pt in pts:
+                x, y = pt
+                draw.ellipse((x - 3, y - 3, x + 3, y + 3), outline=(200, 120, 255), width=2)
+            radius_mm = geom.get("radius_mm")
+            mm_text = f"{radius_mm:.3f}mm" if radius_mm is not None else "mm:N/A"
+            text = f"r={geom['radius_px']:.1f}px / {mm_text}"
+            try:
+                tbbox = draw.textbbox((0, 0), text, font=font)
+                text_w = tbbox[2] - tbbox[0]
+                text_h = tbbox[3] - tbbox[1]
+            except Exception:
+                text_w, text_h = font.getsize(text) if font else (len(text) * 8, 18)
+            x = int(cx + r_px + 6)
+            y = int(cy - text_h - 4)
+            x = max(0, min(img.width - text_w - 4, x))
+            y = max(0, min(img.height - text_h - 4, y))
+            draw.rectangle((x - 3, y - 3, x + text_w + 3, y + text_h + 3), fill=(0, 0, 0, 150))
+            draw.text((x, y), text, fill=(230, 180, 255), font=font)
         return img
 
     def _get_overlay_font(self, size: int = 18):
-        if not hasattr(self, "_cached_overlay_font") or self._cached_overlay_font is None:
-            font = None
+        if not hasattr(self, "_cached_overlay_fonts") or self._cached_overlay_fonts is None:
+            self._cached_overlay_fonts = {}
+        if size in self._cached_overlay_fonts:
+            return self._cached_overlay_fonts[size]
+        font = None
+        for name in ("arial.ttf", "DejaVuSans.ttf"):
             try:
-                font = ImageFont.truetype("arial.ttf", size)
+                font = ImageFont.truetype(name, size)
+                break
             except Exception:
-                try:
-                    font = ImageFont.truetype("DejaVuSans.ttf", size)
-                except Exception:
-                    font = ImageFont.load_default()
-            self._cached_overlay_font = font
-        return self._cached_overlay_font
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        self._cached_overlay_fonts[size] = font
+        return font
 
     def _draw_exposure_gain_overlay(self, image: Image.Image) -> Image.Image:
         """Overlay exposure/gain in the top-right during live view."""
@@ -3105,7 +3593,9 @@ class CameraApp(QtWidgets.QMainWindow):
         if center is None:
             QtWidgets.QMessageBox.information(self, "No selection", "Select a cross location first.")
             return
-        data = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        data = self._display_np_image if self._display_np_image is not None else (
+            self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        )
         if data.ndim == 3:
             data = np.mean(data, axis=2)
         x0, y0 = center
@@ -3637,6 +4127,25 @@ class CameraApp(QtWidgets.QMainWindow):
             if handled:
                 return True
 
+            if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                handled = self._start_measure_text_drag(event)
+            elif event.type() == QtCore.QEvent.Type.MouseMove:
+                handled = self._update_measure_text_drag(event)
+            elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                handled = self._finish_measure_text_drag(event)
+            if handled:
+                return True
+
+            if self._ref_lines or self._ref_arcs:
+                if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                    handled = self._start_ref_line_drag(event) or self._start_ref_arc_drag(event)
+                elif event.type() == QtCore.QEvent.Type.MouseMove:
+                    handled = self._update_ref_line_drag(event) or self._update_ref_arc_drag(event)
+                elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                    handled = self._finish_ref_line_drag(event) or self._finish_ref_arc_drag(event)
+                if handled:
+                    return True
+
             measure_line_ready = (
                 self._measure_active_mode == "line"
                 and len(self._measure_line_points) == 2
@@ -3849,6 +4358,9 @@ class CameraApp(QtWidgets.QMainWindow):
                 and not self._calibration_dragging
                 and not self._measure_line_dragging
                 and not self._measure_arc_dragging
+                and not self._measure_text_dragging
+                and not self._ref_line_dragging
+                and not self._ref_arc_dragging
             )
             self.image_label.set_panning_enabled(allow_pan)
 
@@ -3885,7 +4397,9 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self.last_payload:
             self.coord_label.setText("x: -, y: -, val: -")
             return
-        img = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        img = self._display_np_image if self._display_np_image is not None else (
+            self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        )
         scale = self._last_render_scale if self._last_render_scale else 1.0
         h, w = img.shape[:2]
         src_x = int(x / scale)
@@ -3945,7 +4459,42 @@ class CameraApp(QtWidgets.QMainWindow):
         delta = event.angleDelta().y()
         if delta == 0:
             return False
-        ratios = self._compute_scroll_ratios(event, source_obj)
+        hbar = self.scroll_area.horizontalScrollBar() if getattr(self, "scroll_area", None) else None
+        vbar = self.scroll_area.verticalScrollBar() if getattr(self, "scroll_area", None) else None
+        viewport = self.scroll_area.viewport() if getattr(self, "scroll_area", None) else None
+
+        # Fallback to simple zoom if scrollbars unavailable
+        if not hbar or not vbar or not viewport:
+            if self._fit_to_window:
+                self._fit_to_window = False
+                self._zoom = 1.0
+            factor = 1.15 if delta > 0 else 1 / 1.15
+            new_zoom = min(max(self._zoom * factor, 0.05), 20.0)
+            if abs(new_zoom - self._zoom) < 1e-6:
+                return True
+            self._zoom = new_zoom
+            self._sync_panning_enabled()
+            self._refresh_image_view()
+            event.accept()
+            return True
+
+        # Position of cursor in viewport coordinates
+        pos = event.position().toPoint()
+        if source_obj is self.image_label:
+            view_pos = pos - QtCore.QPoint(hbar.value(), vbar.value())
+        else:
+            view_pos = pos
+
+        # Clamp viewport position
+        view_pos.setX(max(0, min(viewport.width() - 1, view_pos.x())))
+        view_pos.setY(max(0, min(viewport.height() - 1, view_pos.y())))
+
+        # Current image coordinates under cursor
+        current_scale = self._last_render_scale or 1.0
+        label_pos = view_pos + QtCore.QPoint(hbar.value(), vbar.value())
+        img_x = label_pos.x() / current_scale
+        img_y = label_pos.y() / current_scale
+
         if self._fit_to_window:
             self._fit_to_window = False
             self._zoom = 1.0
@@ -3954,9 +4503,19 @@ class CameraApp(QtWidgets.QMainWindow):
         if abs(new_zoom - self._zoom) < 1e-6:
             return True
         self._zoom = new_zoom
+
         self._sync_panning_enabled()
         self._refresh_image_view()
-        self._restore_scroll_from_ratios(ratios)
+
+        # After re-render, place the same image coordinate back under the cursor
+        new_scale = self._last_render_scale or 1.0
+        target_label_x = img_x * new_scale
+        target_label_y = img_y * new_scale
+        target_h = int(target_label_x - view_pos.x())
+        target_v = int(target_label_y - view_pos.y())
+        hbar.setValue(max(0, min(target_h, hbar.maximum())))
+        vbar.setValue(max(0, min(target_v, vbar.maximum())))
+
         event.accept()
         return True
 
@@ -3982,7 +4541,9 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self.last_payload:
             return
         scale = self._last_render_scale if self._last_render_scale else 1.0
-        img = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        img = self._display_np_image if self._display_np_image is not None else (
+            self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        )
         h, w = img.shape[:2]
         src_x = int(x / scale)
         src_y = int(y / scale)
@@ -3991,6 +4552,24 @@ class CameraApp(QtWidgets.QMainWindow):
                 self._calibration_points.append((src_x, src_y))
                 self._calibration_last_axis = self._calibration_axis
                 self._update_calibration_status()
+                self._refresh_image_view()
+            return
+        if self._ref_active_mode == "line":
+            if 0 <= src_x < w and 0 <= src_y < h:
+                self._ref_temp_points.append((src_x, src_y))
+                if len(self._ref_temp_points) == 2:
+                    self._ref_lines.append({"points": list(self._ref_temp_points)})
+                    self._ref_temp_points = []
+                self._update_measure_status()
+                self._refresh_image_view()
+            return
+        if self._ref_active_mode == "arc":
+            if 0 <= src_x < w and 0 <= src_y < h:
+                self._ref_temp_points.append((src_x, src_y))
+                if len(self._ref_temp_points) == 3:
+                    self._ref_arcs.append({"points": list(self._ref_temp_points)})
+                    self._ref_temp_points = []
+                self._update_measure_status()
                 self._refresh_image_view()
             return
         if self._measure_active_mode == "line":

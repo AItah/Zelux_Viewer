@@ -1,15 +1,18 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+
         {
-            "name": "Python Debugger: Current File",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal"
+            "name": "Python Run/Debugger: Current File",  // Custom name for the configuration
+            "type": "debugpy",  // Use debugpy for Python debugging (required now)
+            "request": "launch",  // Launch the program without interactive debugging
+            // "program": "${file}",
+            "program": "${workspaceFolder}/src/main.py",  // Path to your Python script
+            "console": "integratedTerminal",  // Runs in the integrated terminal
+            "justMyCode": false,  // false = breaks also at 3rd parties libraries breakpoints
+            "stopOnEntry": false,  // Do not stop on the first line of code
+            "noDebug": false,  // true = Avoid any debugging options like stepping through or inspecting variables
+            "args": [],
         }
     ]
 }
