@@ -666,6 +666,11 @@ class CameraApp(QtWidgets.QMainWindow):
         self._line_edit_mode = False
         self._line_dragging = False
         self._line_drag_mode: Optional[str] = None
+        self._roi_select_mode = False
+        self._roi_dragging = False
+        self._roi_start: Optional[QtCore.QPointF] = None
+        self._roi_current: Optional[QtCore.QPointF] = None
+        self._roi_rect: Optional[tuple[int, int, int, int]] = None
         self._axis_lines: list[tuple[tuple[int, int], tuple[int, int], QtGui.QColor]] = []
         self._axis_fit_results = {}
         self._axis_center_px: Optional[tuple[float, float]] = None
@@ -701,7 +706,26 @@ class CameraApp(QtWidgets.QMainWindow):
 
         try:
             from beam_profile_fitting import fit_gaussian_2d
-            params = fit_gaussian_2d(data)
+            mode_text = self.fit2d_mode_combo.currentText() if getattr(self, "fit2d_mode_combo", None) else ""
+            use_roi = self._roi_rect is not None
+            roi_offset = (0, 0)
+            fit_data = data
+            if use_roi:
+                x0r, y0r, x1r, y1r = self._roi_rect
+                if x1r - x0r < 5 or y1r - y0r < 5:
+                    QtWidgets.QMessageBox.information(self, "2D Fit", "Selected ROI is too small.")
+                    return
+                fit_data = data[y0r:y1r, x0r:x1r]
+                roi_offset = (x0r, y0r)
+
+            if mode_text == "Moments (fast)":
+                method = "moments"
+            elif mode_text == "Accurate (full LS)":
+                method = "moments_ls"
+            else:
+                method = "fast_ls"
+
+            params = fit_gaussian_2d(fit_data, method=method)
         except Exception as exc:
             self.status_label.setText(f"2D fit failed: {exc}")
             if getattr(self, "gauss_result_label", None):
@@ -715,6 +739,9 @@ class CameraApp(QtWidgets.QMainWindow):
             return
 
         I0, x0, y0, wx, wy, theta, c, ax, ay = params
+        if roi_offset != (0, 0):
+            x0 += roi_offset[0]
+            y0 += roi_offset[1]
         wx = float(abs(wx))
         wy = float(abs(wy))
         angle = float(theta)
@@ -959,6 +986,29 @@ class CameraApp(QtWidgets.QMainWindow):
         self.show_fit_plots_checkbox.stateChanged.connect(self.toggle_fit_plots_window)
         layout.addWidget(self.show_fit_plots_checkbox)
 
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.addWidget(QtWidgets.QLabel("2D fit mode:"))
+        self.fit2d_mode_combo = QtWidgets.QComboBox()
+        self.fit2d_mode_combo.addItems(["Fast (LS, optional ROI)", "Accurate (full LS)", "Moments (fast)"])
+        self.fit2d_mode_combo.currentIndexChanged.connect(self._save_fit_settings)
+        mode_row.addWidget(self.fit2d_mode_combo)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        roi_row = QtWidgets.QHBoxLayout()
+        self.fit_roi_btn = QtWidgets.QPushButton("Select 2D ROI")
+        self.fit_roi_btn.clicked.connect(self.start_fit_roi_selection)
+        roi_row.addWidget(self.fit_roi_btn)
+        self.fit_roi_clear_btn = QtWidgets.QPushButton("Clear ROI")
+        self.fit_roi_clear_btn.clicked.connect(self.clear_fit_roi_selection)
+        roi_row.addWidget(self.fit_roi_clear_btn)
+        roi_row.addStretch(1)
+        layout.addLayout(roi_row)
+
+        self.fit_roi_label = QtWidgets.QLabel("2D ROI: full frame")
+        self.fit_roi_label.setWordWrap(True)
+        layout.addWidget(self.fit_roi_label)
+
         self.gauss_result_label = QtWidgets.QLabel("Gauss X: -, Y: -")
         self.gauss_result_label.setWordWrap(True)
         layout.addWidget(self.gauss_result_label)
@@ -971,6 +1021,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self.axis_fit_status.setWordWrap(True)
         layout.addWidget(self.axis_fit_status)
 
+        self._load_fit_settings()
         window.hide()
         return window
 
@@ -1104,6 +1155,13 @@ class CameraApp(QtWidgets.QMainWindow):
         fft_grid.addWidget(QtWidgets.QLabel("Max pairs (0=all)"), 6, 0)
         fft_grid.addWidget(self.fft_max_pairs_spin, 6, 1)
 
+        self.fft_analysis_scale_spin = QtWidgets.QSpinBox()
+        self.fft_analysis_scale_spin.setRange(1, 8)
+        self.fft_analysis_scale_spin.setValue(1)
+        self.fft_analysis_scale_spin.valueChanged.connect(self._on_fft_params_changed)
+        fft_grid.addWidget(QtWidgets.QLabel("Peak detect downsample (x)"), 7, 0)
+        fft_grid.addWidget(self.fft_analysis_scale_spin, 7, 1)
+
         layout.addWidget(fft_group)
 
         self.fft_steps_checkbox = QtWidgets.QCheckBox("Show FFT Steps")
@@ -1182,6 +1240,7 @@ class CameraApp(QtWidgets.QMainWindow):
             "fft/pair_tol": 2,
             "fft/min_sep": 10,
             "fft/max_pairs": 80,
+            "fft/analysis_scale": 1,
         }
         for key in list(params.keys()):
             params[key] = self._settings.value(key, params[key], type=type(params[key]))
@@ -1193,6 +1252,7 @@ class CameraApp(QtWidgets.QMainWindow):
             (getattr(self, "fft_pair_tol_spin", None), params["fft/pair_tol"]),
             (getattr(self, "fft_min_sep_spin", None), params["fft/min_sep"]),
             (getattr(self, "fft_max_pairs_spin", None), params["fft/max_pairs"]),
+            (getattr(self, "fft_analysis_scale_spin", None), params["fft/analysis_scale"]),
         ]
         for widget, value in widgets:
             if widget is None:
@@ -1230,6 +1290,113 @@ class CameraApp(QtWidgets.QMainWindow):
             self._settings.setValue("fft/min_sep", int(self.fft_min_sep_spin.value()))
         if getattr(self, "fft_max_pairs_spin", None):
             self._settings.setValue("fft/max_pairs", int(self.fft_max_pairs_spin.value()))
+        if getattr(self, "fft_analysis_scale_spin", None):
+            self._settings.setValue("fft/analysis_scale", int(self.fft_analysis_scale_spin.value()))
+
+    def _load_fit_settings(self):
+        if not getattr(self, "_settings", None):
+            return
+        mode = self._settings.value("fit/2d_mode", "Accurate (full LS)", type=str)
+        if mode in ("Fast (moments)", "Fast (ROI LS)"):
+            mode = "Fast (LS, optional ROI)"
+        elif mode in ("Accurate (moments+LS)", "Accurate (full LS)"):
+            mode = "Accurate (full LS)"
+        elif mode in ("Moments (fast)",):
+            mode = "Moments (fast)"
+        if getattr(self, "fit2d_mode_combo", None):
+            idx = self.fit2d_mode_combo.findText(mode)
+            if idx >= 0:
+                self.fit2d_mode_combo.blockSignals(True)
+                self.fit2d_mode_combo.setCurrentIndex(idx)
+                self.fit2d_mode_combo.blockSignals(False)
+
+    def _save_fit_settings(self):
+        if not getattr(self, "_settings", None):
+            return
+        if getattr(self, "fit2d_mode_combo", None):
+            self._settings.setValue("fit/2d_mode", self.fit2d_mode_combo.currentText())
+
+    def _update_fit_roi_label(self):
+        label = getattr(self, "fit_roi_label", None)
+        if not label:
+            return
+        if self._roi_rect is None:
+            label.setText("2D ROI: full frame")
+            return
+        x0, y0, x1, y1 = self._roi_rect
+        label.setText(f"2D ROI: x={x0}-{x1}, y={y0}-{y1} ({x1 - x0}x{y1 - y0})")
+
+    def start_fit_roi_selection(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "2D ROI", "Capture or load an image first.")
+            return
+        self._roi_select_mode = True
+        self._roi_dragging = False
+        self._roi_start = None
+        self._roi_current = None
+        self.status_label.setText("2D ROI: drag on the image to select a rectangle.")
+        self._sync_panning_enabled()
+
+    def clear_fit_roi_selection(self):
+        self._roi_select_mode = False
+        self._roi_dragging = False
+        self._roi_start = None
+        self._roi_current = None
+        self._roi_rect = None
+        self._update_fit_roi_label()
+        self._refresh_image_view()
+        self._sync_panning_enabled()
+
+    def _roi_rect_from_points(self, p1: QtCore.QPointF, p2: QtCore.QPointF) -> tuple[int, int, int, int]:
+        x0 = int(round(min(p1.x(), p2.x())))
+        y0 = int(round(min(p1.y(), p2.y())))
+        x1 = int(round(max(p1.x(), p2.x())))
+        y1 = int(round(max(p1.y(), p2.y())))
+        return x0, y0, x1, y1
+
+    def _start_roi_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if event.button() != QtCore.Qt.MouseButton.LeftButton or not self.last_payload:
+            return False
+        scale = self._last_render_scale or 1.0
+        p = event.position()
+        x, y = self._clamp_point(p.x() / scale, p.y() / scale)
+        self._roi_dragging = True
+        self._roi_start = QtCore.QPointF(x, y)
+        self._roi_current = QtCore.QPointF(x, y)
+        event.accept()
+        self._refresh_image_view()
+        return True
+
+    def _update_roi_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._roi_dragging or self._roi_start is None or not self.last_payload:
+            return False
+        scale = self._last_render_scale or 1.0
+        p = event.position()
+        x, y = self._clamp_point(p.x() / scale, p.y() / scale)
+        self._roi_current = QtCore.QPointF(x, y)
+        event.accept()
+        self._refresh_image_view()
+        return True
+
+    def _finish_roi_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._roi_dragging or self._roi_start is None or self._roi_current is None:
+            return False
+        x0, y0, x1, y1 = self._roi_rect_from_points(self._roi_start, self._roi_current)
+        self._roi_dragging = False
+        self._roi_select_mode = False
+        self._roi_start = None
+        self._roi_current = None
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            self.status_label.setText("2D ROI: selection too small.")
+            self._sync_panning_enabled()
+            self._refresh_image_view()
+            return True
+        self._roi_rect = (x0, y0, x1, y1)
+        self._update_fit_roi_label()
+        self.status_label.setText("2D ROI updated.")
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+        return True
 
     def _format_fft_param_snapshot(self) -> str:
         dc_radius = int(getattr(self, "fft_dc_radius_spin", None).value()) if getattr(self, "fft_dc_radius_spin", None) else 10
@@ -1238,9 +1405,10 @@ class CameraApp(QtWidgets.QMainWindow):
         pair_tol = int(getattr(self, "fft_pair_tol_spin", None).value()) if getattr(self, "fft_pair_tol_spin", None) else 2
         min_sep = int(getattr(self, "fft_min_sep_spin", None).value()) if getattr(self, "fft_min_sep_spin", None) else 10
         max_pairs = int(getattr(self, "fft_max_pairs_spin", None).value()) if getattr(self, "fft_max_pairs_spin", None) else 80
+        analysis_scale = int(getattr(self, "fft_analysis_scale_spin", None).value()) if getattr(self, "fft_analysis_scale_spin", None) else 1
         return (
             f"dc={dc_radius},mask={mask_radius},sigma={threshold_sigma:.2f},"
-            f"pair_tol={pair_tol},min_sep={min_sep},max_pairs={max_pairs}"
+            f"pair_tol={pair_tol},min_sep={min_sep},max_pairs={max_pairs},scale={analysis_scale}"
         )
 
     def _log_fft_timing(
@@ -1279,6 +1447,8 @@ class CameraApp(QtWidgets.QMainWindow):
                     parts.append(f"fft_ms={timings.get('fft_ms', 0.0):.1f}")
                     parts.append(f"mask_ms={timings.get('mask_ms', 0.0):.1f}")
                     parts.append(f"ifft_ms={timings.get('ifft_ms', 0.0):.1f}")
+                if timings.get("gpu_error"):
+                    parts.append(f"gpu_error={timings.get('gpu_error')}")
             if note:
                 parts.append(f"note={note}")
             line = " | ".join(parts) + "\n"
@@ -1730,7 +1900,9 @@ class CameraApp(QtWidgets.QMainWindow):
         # self.gamma_spin.setValue(float(getattr(self.camera, "gamma", 1.0)))
         self._set_camera_controls_enabled(True)
 
-    def _connect_first_available_camera(self, show_message: bool = True, force: bool = False) -> bool:
+    def _connect_first_available_camera(
+        self, show_message: bool = True, force: bool = False, allow_opencv: bool = False
+    ) -> bool:
         if force:
             self._dispose_camera()
         elif self.camera or (self._use_cv and self.cv_index is not None) or (self._use_pylon and self.pylon_device_info):
@@ -1757,7 +1929,7 @@ class CameraApp(QtWidgets.QMainWindow):
             if pylon_list:
                 return self._open_pylon_camera(pylon_list[0], show_message=show_message)
 
-        if _HAVE_OPENCV:
+        if allow_opencv and _HAVE_OPENCV:
             generic_indices = self._discover_generic_indices()
             if generic_indices:
                 return self._open_generic_camera(generic_indices[0], show_message=show_message)
@@ -1850,7 +2022,7 @@ class CameraApp(QtWidgets.QMainWindow):
         return True
 
     def _ensure_camera(self, show_message: bool = True) -> bool:
-        return self._connect_first_available_camera(show_message=show_message)
+        return self._connect_first_available_camera(show_message=show_message, allow_opencv=False)
 
     def connect_camera(self):
         self._show_camera_selection_dialog()
@@ -2213,6 +2385,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 pair_tol = int(getattr(self, "fft_pair_tol_spin", None).value()) if getattr(self, "fft_pair_tol_spin", None) else 2
                 min_sep = int(getattr(self, "fft_min_sep_spin", None).value()) if getattr(self, "fft_min_sep_spin", None) else 10
                 max_pairs = int(getattr(self, "fft_max_pairs_spin", None).value()) if getattr(self, "fft_max_pairs_spin", None) else 80
+                analysis_scale = int(getattr(self, "fft_analysis_scale_spin", None).value()) if getattr(self, "fft_analysis_scale_spin", None) else 1
                 cleaned, steps = fft_clean_image_steps(
                     raw_np,
                     mask_radius=mask_radius,
@@ -2221,6 +2394,7 @@ class CameraApp(QtWidgets.QMainWindow):
                     pair_tol=pair_tol,
                     min_sep=min_sep,
                     max_pairs=max_pairs,
+                    analysis_scale=analysis_scale,
                 )
                 if steps:
                     self._last_fft_timings = steps.get("timings")
@@ -3975,6 +4149,7 @@ class CameraApp(QtWidgets.QMainWindow):
         img = self._np_to_pil_image(base_np)
         if self._gauss_fit:
             img = self._draw_gaussian_contour(img, self._gauss_fit)
+        img = self._draw_roi_overlay(img)
         if len(self._line_points) == 2:
             img = self._draw_line_segment(img, self._line_points, color=(255, 215, 0))
         if self._axis_lines:
@@ -4268,6 +4443,25 @@ class CameraApp(QtWidgets.QMainWindow):
         draw.rectangle(rect, fill=(0, 0, 0, 128))
         draw.text((text_x, text_y), text, fill=(255, 215, 0, 255), font=font)
         return base.convert("RGB") if image.mode != "RGBA" else base
+
+    def _draw_roi_overlay(self, image: Image.Image) -> Image.Image:
+        rect = None
+        if self._roi_dragging and self._roi_start is not None and self._roi_current is not None:
+            rect = self._roi_rect_from_points(self._roi_start, self._roi_current)
+        elif self._roi_rect is not None:
+            rect = self._roi_rect
+        if rect is None:
+            return image
+
+        x0, y0, x1, y1 = rect
+        if x1 <= x0 or y1 <= y0:
+            return image
+
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((x0, y0, x1, y1), outline=(0, 255, 128), width=2)
+        return image
 
     def compute_gaussian_fit(self):
         if not self.last_payload:
@@ -4642,6 +4836,16 @@ class CameraApp(QtWidgets.QMainWindow):
             if self._handle_wheel_zoom(event, obj):
                 return True
         elif obj is getattr(self, "image_label", None):
+            if self._roi_select_mode or self._roi_dragging:
+                if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                    if self._start_roi_drag(event):
+                        return True
+                elif event.type() == QtCore.QEvent.Type.MouseMove:
+                    if self._update_roi_drag(event):
+                        return True
+                elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                    if self._finish_roi_drag(event):
+                        return True
             calib_drag_ready = (
                 len(self._calibration_points) == 2
                 and self._calibration_axis is not None
@@ -4838,7 +5042,8 @@ class CameraApp(QtWidgets.QMainWindow):
             payload = FramePayload(pil_image=img, np_image=np_img, np_image_raw=np_img, frame_count=-1)
             self.cross_pos = None
             self._display_frame(payload)
-            self.status_label.setText(f"Loaded {path}")
+            self.setWindowTitle(f"No camera - {path}")
+            self.status_label.setText(f"Loaded")
             self._settings.setValue("last_image_dir", os.path.dirname(path))
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load image: {exc}")
@@ -4885,6 +5090,8 @@ class CameraApp(QtWidgets.QMainWindow):
         if getattr(self, "image_label", None):
             allow_pan = (
                 not self._fit_to_window
+                and not self._roi_select_mode
+                and not self._roi_dragging
                 and not self._line_edit_mode
                 and not self._calibration_dragging
                 and not self._measure_line_dragging
@@ -4893,7 +5100,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 and not self._ref_line_dragging
                 and not self._ref_arc_dragging
             )
-            self.image_label.set_panning_enabled(allow_pan)
+        self.image_label.set_panning_enabled(allow_pan)
 
     def _reset_pan(self):
         if not getattr(self, "scroll_area", None):
@@ -4938,7 +5145,7 @@ class CameraApp(QtWidgets.QMainWindow):
         if 0 <= src_x < w and 0 <= src_y < h:
             val = img[src_y, src_x]
             if isinstance(val, np.ndarray):
-                val = val.tolist()
+                val = val.astype(int).tolist()
             gray_val = None
             if img.ndim == 2:
                 gray_val = int(img[src_y, src_x])
