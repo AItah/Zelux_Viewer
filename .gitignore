@@ -5,6 +5,7 @@ build
 *.zip
 *.spec
 __pycache__
+Helpers
 # Ignore everything under "Scientific Camera Interfaces"...
 vendor/Scientific Camera Interfaces/*
 # ...but keep SDK/Python Toolkit (need to unignore parents first)
