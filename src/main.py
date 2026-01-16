@@ -40,7 +40,6 @@ try:
     _HAVE_PYLON = True
 except Exception:  # pragma: no cover - optional dependency
     _HAVE_PYLON = False
-from beam_profile_fitting import gaussian_or_lorentzian_aic
 from PyQt6 import QtCore, QtGui, QtWidgets
 from thorlabs_tsi_sdk.tl_camera import Frame, TLCamera, TLCameraSDK
 from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
@@ -85,6 +84,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 class FramePayload:
     pil_image: Image.Image
     np_image: np.ndarray
+    np_image_raw: np.ndarray
     frame_count: int
 
 
@@ -135,7 +135,12 @@ class ImageAcquisitionThread(threading.Thread):
             scaled_image = frame.image_buffer >> (self._bit_depth - 8)
             np_image = scaled_image
             pil_image = Image.fromarray(scaled_image)
-        return FramePayload(pil_image=pil_image, np_image=np_image, frame_count=frame.frame_count)
+        return FramePayload(
+            pil_image=pil_image,
+            np_image=np_image,
+            np_image_raw=np_image,
+            frame_count=frame.frame_count,
+        )
 
     def run(self):
         while not self._stop_event.is_set():
@@ -390,7 +395,7 @@ class GenericVideoThread(threading.Thread):
         # frame is BGR uint8
         np_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(np_image, mode="RGB")
-        return FramePayload(pil_image=pil_image, np_image=np_image, frame_count=0)
+        return FramePayload(pil_image=pil_image, np_image=np_image, np_image_raw=np_image, frame_count=0)
 
     def run(self):
         if not self._open_capture():
@@ -553,7 +558,12 @@ class PylonVideoThread(threading.Thread):
                         np_image = img_arr
                         pil_image = Image.fromarray(np_image, mode="RGB")
                     self.frame_count += 1
-                    payload = FramePayload(pil_image=pil_image, np_image=np_image, frame_count=self.frame_count)
+                    payload = FramePayload(
+                        pil_image=pil_image,
+                        np_image=np_image,
+                        np_image_raw=np_image,
+                        frame_count=self.frame_count,
+                    )
                     try:
                         self._queue.put_nowait(payload)
                     except queue.Full:
@@ -575,6 +585,7 @@ class CameraApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self._fft_enabled = False  # Add this line to track state
+        self._fft_steps_enabled = False
         os.makedirs(DATA_DIR, exist_ok=True)
         self.sdk = TLCameraSDK()
         self.camera: Optional[TLCamera] = None
@@ -601,7 +612,11 @@ class CameraApp(QtWidgets.QMainWindow):
         self._gauss_fit_2d = None
         self._hist_window_positioned = False
         self._fit_window_positioned = False
+        self._fit_plots_window_positioned = False
         self._filters_window_positioned = False
+        self._fft_mag_window_positioned = False
+        self._fft_mask_window_positioned = False
+        self._fft_ifft_window_positioned = False
         self._calibration_window_positioned = False
         self._calibration_axis: Optional[str] = None  # "x", "y", or "both" while active
         self._calibration_last_axis: Optional[str] = None  # remember last calibrated axis for overlay
@@ -657,6 +672,9 @@ class CameraApp(QtWidgets.QMainWindow):
         self._settings = QtCore.QSettings("BaslerTool", "Viewer")
         self._filtered_np_image: Optional[np.ndarray] = None
         self._pending_sections: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._last_fft_timings: Optional[dict] = None
+        self._fft_toggle_log_pending: Optional[dict] = None
+        self._fft_log_path = os.path.join(DATA_DIR, "fft_timing_log.txt")
 
         self._restore_window_state(self, "main_window")
         self.setWindowTitle("Live View - No camera")
@@ -669,12 +687,6 @@ class CameraApp(QtWidgets.QMainWindow):
         self.poll_timer.setInterval(15)
         self.poll_timer.timeout.connect(self._poll_queue)
         self.poll_timer.start()
-
-    def _toggle_fft_cleaning(self):
-        self._fft_enabled = self.fft_clean_btn.isChecked()
-        status = "ON" if self._fft_enabled else "OFF"
-        self.fft_clean_btn.setText(f"Clean FFT: {status}")
-        self._refresh_image_view()
 
     def compute_2d_gaussian_fit(self):
         """Fit a rotated 2D Gaussian spot on the current image."""
@@ -808,24 +820,61 @@ class CameraApp(QtWidgets.QMainWindow):
         self.fit_window = self._build_fit_window()
         self.fit_window.installEventFilter(self)
 
+        self.fit_plots_window = self._build_fit_plots_window()
+        self.fit_plots_window.installEventFilter(self)
+
         self.filters_window = self._build_filters_window()
         self.filters_window.installEventFilter(self)
+
+        self.fft_mag_window, self.fft_mag_label = self._build_fft_step_window("FFT Magnitude", QtCore.QSize(360, 240))
+        self.fft_mag_window.installEventFilter(self)
+        self.fft_mask_window, self.fft_mask_label = self._build_fft_step_window("FFT Peaks Mask", QtCore.QSize(360, 240))
+        self.fft_mask_window.installEventFilter(self)
+        self.fft_ifft_window, self.fft_ifft_label = self._build_fft_step_window("FFT Cleaned (IFFT)", QtCore.QSize(360, 240))
+        self.fft_ifft_window.installEventFilter(self)
 
         self.calibration_window = self._build_calibration_window()
         self.calibration_window.installEventFilter(self)
 
         self._restore_window_state(self.hist_window, "hist_window")
         self._restore_window_state(self.fit_window, "fit_window")
+        fit_plots_restored = self._restore_window_state(self.fit_plots_window, "fit_plots_window")
         filters_restored = self._restore_window_state(self.filters_window, "filters_window")
+        fft_mag_restored = self._restore_window_state(self.fft_mag_window, "fft_mag_window")
+        fft_mask_restored = self._restore_window_state(self.fft_mask_window, "fft_mask_window")
+        fft_ifft_restored = self._restore_window_state(self.fft_ifft_window, "fft_ifft_window")
         calib_restored = self._restore_window_state(self.calibration_window, "calibration_window")
+        self._apply_fft_window_limits(self.fft_mag_window)
+        self._apply_fft_window_limits(self.fft_mask_window)
+        self._apply_fft_window_limits(self.fft_ifft_window)
         if filters_restored:
             self._filters_window_positioned = True
+        if fit_plots_restored:
+            self._fit_plots_window_positioned = True
+        if fft_mag_restored:
+            self._fft_mag_window_positioned = True
+        if fft_mask_restored:
+            self._fft_mask_window_positioned = True
+        if fft_ifft_restored:
+            self._fft_ifft_window_positioned = True
         if calib_restored:
             self._calibration_window_positioned = True
         if getattr(self, "filters_checkbox", None) and self.filters_window.isVisible():
             self.filters_checkbox.blockSignals(True)
             self.filters_checkbox.setChecked(True)
             self.filters_checkbox.blockSignals(False)
+        if getattr(self, "show_fit_plots_checkbox", None) and self.fit_plots_window.isVisible():
+            self.show_fit_plots_checkbox.blockSignals(True)
+            self.show_fit_plots_checkbox.setChecked(True)
+            self.show_fit_plots_checkbox.blockSignals(False)
+        if (
+            getattr(self, "fft_steps_checkbox", None)
+            and (self.fft_mag_window.isVisible() or self.fft_mask_window.isVisible() or self.fft_ifft_window.isVisible())
+        ):
+            self._fft_steps_enabled = True
+            self.fft_steps_checkbox.blockSignals(True)
+            self.fft_steps_checkbox.setChecked(True)
+            self.fft_steps_checkbox.blockSignals(False)
         if getattr(self, "measure_checkbox", None) and self.calibration_window.isVisible():
             self.measure_checkbox.blockSignals(True)
             self.measure_checkbox.setChecked(True)
@@ -894,10 +943,9 @@ class CameraApp(QtWidgets.QMainWindow):
         self.line_fit_btn = QtWidgets.QPushButton("2-Point Line Fit")
         self.line_fit_btn.clicked.connect(self.start_line_fit_selection)
         btn_row.addWidget(self.line_fit_btn)
-        self.run_scipy_btn = QtWidgets.QPushButton("SciPy Fit")
-        self.run_scipy_btn.clicked.connect(self.run_scipy_fit)
-        self.run_scipy_btn.setEnabled(True)
-        btn_row.addWidget(self.run_scipy_btn)
+        self.run_line_fit_btn = QtWidgets.QPushButton("Run Line Fit")
+        self.run_line_fit_btn.clicked.connect(self.run_line_fit)
+        btn_row.addWidget(self.run_line_fit_btn)
         self.spot_fit_btn = QtWidgets.QPushButton("2D Spot Fit")
         self.spot_fit_btn.clicked.connect(self.compute_2d_gaussian_fit)
         btn_row.addWidget(self.spot_fit_btn)
@@ -907,6 +955,10 @@ class CameraApp(QtWidgets.QMainWindow):
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
+        self.show_fit_plots_checkbox = QtWidgets.QCheckBox("Show Fit Plots")
+        self.show_fit_plots_checkbox.stateChanged.connect(self.toggle_fit_plots_window)
+        layout.addWidget(self.show_fit_plots_checkbox)
+
         self.gauss_result_label = QtWidgets.QLabel("Gauss X: -, Y: -")
         self.gauss_result_label.setWordWrap(True)
         layout.addWidget(self.gauss_result_label)
@@ -915,24 +967,47 @@ class CameraApp(QtWidgets.QMainWindow):
         self.line_fit_status.setWordWrap(True)
         layout.addWidget(self.line_fit_status)
 
-        self.line_plot_label = QtWidgets.QLabel()
-        self.line_plot_label.setMinimumHeight(180)
-        self.line_plot_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.line_plot_label)
-
         self.axis_fit_status = QtWidgets.QLabel("360 fit: not computed.")
         self.axis_fit_status.setWordWrap(True)
         layout.addWidget(self.axis_fit_status)
 
-        self.axis_plot_h = QtWidgets.QLabel()
-        self.axis_plot_h.setMinimumHeight(140)
-        self.axis_plot_h.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.axis_plot_h)
+        window.hide()
+        return window
 
-        self.axis_plot_v = QtWidgets.QLabel()
-        self.axis_plot_v.setMinimumHeight(140)
+    def _build_fit_plots_window(self) -> QtWidgets.QWidget:
+        window = QtWidgets.QWidget(None, QtCore.Qt.WindowType.Window)
+        window.setWindowTitle("Fit Plots")
+        window.resize(620, 660)
+
+        layout = QtWidgets.QVBoxLayout(window)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.line_plot_label = QtWidgets.QLabel(window)
+        self.line_plot_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.line_plot_label.setStyleSheet("background-color: #111;")
+        self.line_plot_label.setScaledContents(True)
+        self.line_plot_label.setMinimumSize(320, 180)
+        layout.addWidget(self.line_plot_label, stretch=2)
+
+        self.axis_plot_h = QtWidgets.QLabel(window)
+        self.axis_plot_h.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.axis_plot_h.setStyleSheet("background-color: #111;")
+        self.axis_plot_h.setScaledContents(True)
+        self.axis_plot_h.setMinimumSize(260, 140)
+        layout.addWidget(self.axis_plot_h, stretch=1)
+
+        self.axis_plot_v = QtWidgets.QLabel(window)
         self.axis_plot_v.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.axis_plot_v)
+        self.axis_plot_v.setStyleSheet("background-color: #111;")
+        self.axis_plot_v.setScaledContents(True)
+        self.axis_plot_v.setMinimumSize(260, 140)
+        layout.addWidget(self.axis_plot_v, stretch=1)
+
+        grip_row = QtWidgets.QHBoxLayout()
+        grip_row.addStretch(1)
+        grip_row.addWidget(QtWidgets.QSizeGrip(window))
+        layout.addLayout(grip_row)
 
         window.hide()
         return window
@@ -979,8 +1054,278 @@ class CameraApp(QtWidgets.QMainWindow):
         layout.addLayout(filter_row)
         self._sync_filter_controls()
 
+        fft_group = QtWidgets.QGroupBox("FFT Cleaning")
+        fft_grid = QtWidgets.QGridLayout(fft_group)
+        self.fft_clean_btn = QtWidgets.QCheckBox("Clean FFT")
+        self.fft_clean_btn.stateChanged.connect(self._toggle_fft_cleaning)
+        fft_grid.addWidget(self.fft_clean_btn, 0, 0, 1, 2)
+
+        self.fft_dc_radius_spin = QtWidgets.QSpinBox()
+        self.fft_dc_radius_spin.setRange(0, 5000)
+        self.fft_dc_radius_spin.setValue(15)
+        self.fft_dc_radius_spin.valueChanged.connect(self._on_fft_params_changed)
+        fft_grid.addWidget(QtWidgets.QLabel("Center keep radius (px)"), 1, 0)
+        fft_grid.addWidget(self.fft_dc_radius_spin, 1, 1)
+
+        self.fft_mask_radius_spin = QtWidgets.QSpinBox()
+        self.fft_mask_radius_spin.setRange(1, 500)
+        self.fft_mask_radius_spin.setValue(7)
+        self.fft_mask_radius_spin.valueChanged.connect(self._on_fft_params_changed)
+        fft_grid.addWidget(QtWidgets.QLabel("Notch radius (px)"), 2, 0)
+        fft_grid.addWidget(self.fft_mask_radius_spin, 2, 1)
+
+        self.fft_sigma_spin = QtWidgets.QDoubleSpinBox()
+        self.fft_sigma_spin.setRange(0.1, 20.0)
+        self.fft_sigma_spin.setDecimals(2)
+        self.fft_sigma_spin.setSingleStep(0.25)
+        self.fft_sigma_spin.setValue(1.0)
+        self.fft_sigma_spin.valueChanged.connect(self._on_fft_params_changed)
+        fft_grid.addWidget(QtWidgets.QLabel("Peak threshold (sigma)"), 3, 0)
+        fft_grid.addWidget(self.fft_sigma_spin, 3, 1)
+
+        self.fft_pair_tol_spin = QtWidgets.QSpinBox()
+        self.fft_pair_tol_spin.setRange(0, 20)
+        self.fft_pair_tol_spin.setValue(0)
+        self.fft_pair_tol_spin.valueChanged.connect(self._on_fft_params_changed)
+        fft_grid.addWidget(QtWidgets.QLabel("Pair tolerance (px)"), 4, 0)
+        fft_grid.addWidget(self.fft_pair_tol_spin, 4, 1)
+
+        self.fft_min_sep_spin = QtWidgets.QSpinBox()
+        self.fft_min_sep_spin.setRange(0, 200)
+        self.fft_min_sep_spin.setValue(0)
+        self.fft_min_sep_spin.valueChanged.connect(self._on_fft_params_changed)
+        fft_grid.addWidget(QtWidgets.QLabel("Min peak separation (px)"), 5, 0)
+        fft_grid.addWidget(self.fft_min_sep_spin, 5, 1)
+
+        self.fft_max_pairs_spin = QtWidgets.QSpinBox()
+        self.fft_max_pairs_spin.setRange(0, 500)
+        self.fft_max_pairs_spin.setValue(40)
+        self.fft_max_pairs_spin.valueChanged.connect(self._on_fft_params_changed)
+        fft_grid.addWidget(QtWidgets.QLabel("Max pairs (0=all)"), 6, 0)
+        fft_grid.addWidget(self.fft_max_pairs_spin, 6, 1)
+
+        layout.addWidget(fft_group)
+
+        self.fft_steps_checkbox = QtWidgets.QCheckBox("Show FFT Steps")
+        self.fft_steps_checkbox.stateChanged.connect(self.toggle_fft_steps)
+        layout.addWidget(self.fft_steps_checkbox)
+
+        self.fft_timing_label = QtWidgets.QLabel("FFT timing: -")
+        self.fft_timing_label.setStyleSheet("color: #ccc;")
+        self.fft_timing_label.setWordWrap(True)
+        layout.addWidget(self.fft_timing_label)
+
+        self._load_fft_settings()
         window.hide()
         return window
+
+    def _build_fft_step_window(
+        self, title: str, size: QtCore.QSize
+    ) -> tuple[QtWidgets.QWidget, QtWidgets.QLabel]:
+        window = QtWidgets.QWidget(None, QtCore.Qt.WindowType.Window)
+        window.setWindowTitle(title)
+        capped = self._cap_fft_window_size(size)
+        window.resize(capped)
+        window.setMaximumSize(capped)
+
+        layout = QtWidgets.QVBoxLayout(window)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        label = QtWidgets.QLabel(window)
+        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("background-color: #111;")
+        label.setScaledContents(True)
+        layout.addWidget(label)
+
+        grip_row = QtWidgets.QHBoxLayout()
+        grip_row.addStretch(1)
+        grip_row.addWidget(QtWidgets.QSizeGrip(window))
+        layout.addLayout(grip_row)
+
+        window.hide()
+        return window, label
+
+    def _cap_fft_window_size(self, size: QtCore.QSize) -> QtCore.QSize:
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return size
+        avail = screen.availableGeometry()
+        max_w = int(avail.width() * 0.75)
+        max_h = int(avail.height() * 0.75)
+        return QtCore.QSize(min(size.width(), max_w), min(size.height(), max_h))
+
+    def _apply_fft_window_limits(self, window: QtWidgets.QWidget):
+        if not window:
+            return
+        screen = QtGui.QGuiApplication.screenAt(window.frameGeometry().center())
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        max_w = int(avail.width() * 0.75)
+        max_h = int(avail.height() * 0.75)
+        window.setMaximumSize(QtCore.QSize(max_w, max_h))
+        if window.width() > max_w or window.height() > max_h:
+            window.resize(min(window.width(), max_w), min(window.height(), max_h))
+
+    def _load_fft_settings(self):
+        if not getattr(self, "_settings", None):
+            return
+        enabled = self._settings.value("fft/clean_enabled", False, type=bool)
+        steps_enabled = self._settings.value("fft/steps_enabled", False, type=bool)
+        params = {
+            "fft/dc_radius": 10,
+            "fft/mask_radius": 8,
+            "fft/threshold_sigma": 5.0,
+            "fft/pair_tol": 2,
+            "fft/min_sep": 10,
+            "fft/max_pairs": 80,
+        }
+        for key in list(params.keys()):
+            params[key] = self._settings.value(key, params[key], type=type(params[key]))
+
+        widgets = [
+            (getattr(self, "fft_dc_radius_spin", None), params["fft/dc_radius"]),
+            (getattr(self, "fft_mask_radius_spin", None), params["fft/mask_radius"]),
+            (getattr(self, "fft_sigma_spin", None), params["fft/threshold_sigma"]),
+            (getattr(self, "fft_pair_tol_spin", None), params["fft/pair_tol"]),
+            (getattr(self, "fft_min_sep_spin", None), params["fft/min_sep"]),
+            (getattr(self, "fft_max_pairs_spin", None), params["fft/max_pairs"]),
+        ]
+        for widget, value in widgets:
+            if widget is None:
+                continue
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        if getattr(self, "fft_clean_btn", None):
+            self.fft_clean_btn.blockSignals(True)
+            self.fft_clean_btn.setChecked(bool(enabled))
+            self.fft_clean_btn.blockSignals(False)
+            self._fft_enabled = bool(enabled)
+        if getattr(self, "fft_steps_checkbox", None):
+            self.fft_steps_checkbox.blockSignals(True)
+            self.fft_steps_checkbox.setChecked(bool(steps_enabled))
+            self.fft_steps_checkbox.blockSignals(False)
+            self._fft_steps_enabled = bool(steps_enabled)
+
+    def _save_fft_settings(self):
+        if not getattr(self, "_settings", None):
+            return
+        if getattr(self, "fft_clean_btn", None):
+            self._settings.setValue("fft/clean_enabled", self.fft_clean_btn.isChecked())
+        if getattr(self, "fft_steps_checkbox", None):
+            self._settings.setValue("fft/steps_enabled", self.fft_steps_checkbox.isChecked())
+        if getattr(self, "fft_dc_radius_spin", None):
+            self._settings.setValue("fft/dc_radius", int(self.fft_dc_radius_spin.value()))
+        if getattr(self, "fft_mask_radius_spin", None):
+            self._settings.setValue("fft/mask_radius", int(self.fft_mask_radius_spin.value()))
+        if getattr(self, "fft_sigma_spin", None):
+            self._settings.setValue("fft/threshold_sigma", float(self.fft_sigma_spin.value()))
+        if getattr(self, "fft_pair_tol_spin", None):
+            self._settings.setValue("fft/pair_tol", int(self.fft_pair_tol_spin.value()))
+        if getattr(self, "fft_min_sep_spin", None):
+            self._settings.setValue("fft/min_sep", int(self.fft_min_sep_spin.value()))
+        if getattr(self, "fft_max_pairs_spin", None):
+            self._settings.setValue("fft/max_pairs", int(self.fft_max_pairs_spin.value()))
+
+    def _format_fft_param_snapshot(self) -> str:
+        dc_radius = int(getattr(self, "fft_dc_radius_spin", None).value()) if getattr(self, "fft_dc_radius_spin", None) else 10
+        mask_radius = int(getattr(self, "fft_mask_radius_spin", None).value()) if getattr(self, "fft_mask_radius_spin", None) else 8
+        threshold_sigma = float(getattr(self, "fft_sigma_spin", None).value()) if getattr(self, "fft_sigma_spin", None) else 5.0
+        pair_tol = int(getattr(self, "fft_pair_tol_spin", None).value()) if getattr(self, "fft_pair_tol_spin", None) else 2
+        min_sep = int(getattr(self, "fft_min_sep_spin", None).value()) if getattr(self, "fft_min_sep_spin", None) else 10
+        max_pairs = int(getattr(self, "fft_max_pairs_spin", None).value()) if getattr(self, "fft_max_pairs_spin", None) else 80
+        return (
+            f"dc={dc_radius},mask={mask_radius},sigma={threshold_sigma:.2f},"
+            f"pair_tol={pair_tol},min_sep={min_sep},max_pairs={max_pairs}"
+        )
+
+    def _log_fft_timing(
+        self,
+        action: str,
+        elapsed_ms: float,
+        payload: Optional[FramePayload],
+        timings: Optional[dict],
+        note: Optional[str] = None,
+    ):
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            size = "-"
+            if payload is not None and getattr(payload, "np_image", None) is not None:
+                shape = payload.np_image.shape
+                if len(shape) >= 2:
+                    size = f"{shape[1]}x{shape[0]}"
+            parts = [
+                ts,
+                f"action={action}",
+                f"elapsed_ms={elapsed_ms:.1f}",
+                f"size={size}",
+                f"fft_enabled={int(self._fft_enabled)}",
+                f"params={self._format_fft_param_snapshot()}",
+            ]
+            if timings:
+                backend = timings.get("backend", "cpu")
+                parts.append(f"backend={backend}")
+                if backend == "gpu":
+                    parts.append(f"upload_ms={timings.get('upload_ms', 0.0):.1f}")
+                    parts.append(f"fft_ms={timings.get('fft_ms', 0.0):.1f}")
+                    parts.append(f"mask_ms={timings.get('mask_ms', 0.0):.1f}")
+                    parts.append(f"ifft_ms={timings.get('ifft_ms', 0.0):.1f}")
+                    parts.append(f"download_ms={timings.get('download_ms', 0.0):.1f}")
+                else:
+                    parts.append(f"fft_ms={timings.get('fft_ms', 0.0):.1f}")
+                    parts.append(f"mask_ms={timings.get('mask_ms', 0.0):.1f}")
+                    parts.append(f"ifft_ms={timings.get('ifft_ms', 0.0):.1f}")
+            if note:
+                parts.append(f"note={note}")
+            line = " | ".join(parts) + "\n"
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(self._fft_log_path, "a", encoding="ascii", errors="ignore") as handle:
+                handle.write(line)
+        except Exception:
+            pass
+
+    def _show_fft_step_windows(self):
+        anchor_geom = None
+        if getattr(self, "controls_window", None):
+            ctrl_geom = self.controls_window.frameGeometry()
+            if ctrl_geom.isValid():
+                anchor_geom = ctrl_geom
+        if getattr(self, "fft_mag_window", None):
+            if not self._fft_mag_window_positioned:
+                self._position_window_near_main(
+                    self.fft_mag_window, QtCore.QPoint(18, 520 if anchor_geom else 220), anchor_geom=anchor_geom
+                )
+                self._fft_mag_window_positioned = True
+            self.fft_mag_window.show()
+            self.fft_mag_window.raise_()
+        if getattr(self, "fft_mask_window", None):
+            if not self._fft_mask_window_positioned:
+                self._position_window_near_main(
+                    self.fft_mask_window, QtCore.QPoint(18, 760 if anchor_geom else 300), anchor_geom=anchor_geom
+                )
+                self._fft_mask_window_positioned = True
+            self.fft_mask_window.show()
+            self.fft_mask_window.raise_()
+        if getattr(self, "fft_ifft_window", None):
+            if not self._fft_ifft_window_positioned:
+                self._position_window_near_main(
+                    self.fft_ifft_window, QtCore.QPoint(18, 1000 if anchor_geom else 380), anchor_geom=anchor_geom
+                )
+                self._fft_ifft_window_positioned = True
+            self.fft_ifft_window.show()
+            self.fft_ifft_window.raise_()
+
+    def _hide_fft_step_windows(self):
+        if getattr(self, "fft_mag_window", None):
+            self.fft_mag_window.hide()
+        if getattr(self, "fft_mask_window", None):
+            self.fft_mask_window.hide()
+        if getattr(self, "fft_ifft_window", None):
+            self.fft_ifft_window.hide()
 
     def _build_calibration_window(self) -> QtWidgets.QWidget:
         window = QtWidgets.QWidget(None, QtCore.Qt.WindowType.Window)
@@ -1155,13 +1500,6 @@ class CameraApp(QtWidgets.QMainWindow):
         row2.addWidget(self.measure_checkbox)
         row2.addStretch(1)
 
-        
-        self.fft_clean_btn = QtWidgets.QPushButton("Clean FFT: OFF")
-        self.fft_clean_btn.setCheckable(True)
-        self.fft_clean_btn.clicked.connect(self._toggle_fft_cleaning)
-        layout.addWidget(self.fft_clean_btn)
-        
-        
         layout.addLayout(row1)
         layout.addLayout(row2)
         return layout
@@ -1719,9 +2057,22 @@ class CameraApp(QtWidgets.QMainWindow):
     def _toggle_fft_cleaning(self):
         """Updates the button state and forces a view refresh."""
         enabled = self.fft_clean_btn.isChecked()
-        self.fft_clean_btn.setText(f"Clean FFT: {'ON' if enabled else 'OFF'}")
-        self.fft_clean_btn.setStyleSheet(f"background-color: {'#aaffaa' if enabled else '#f0f0f0'};")
+        self._fft_enabled = enabled
+        self._save_fft_settings()
+        self._fft_toggle_log_pending = {
+            "action": "enable" if enabled else "disable",
+            "start": time.perf_counter(),
+        }
+        if not enabled and getattr(self, "fft_timing_label", None):
+            self.fft_timing_label.setText("FFT timing: -")
         if self.last_payload:
+            self._display_frame(self.last_payload)
+        else:
+            self._refresh_image_view()
+
+    def _on_fft_params_changed(self, *args):
+        self._save_fft_settings()
+        if self._fft_enabled and self.last_payload:
             self._display_frame(self.last_payload)
     
     def _update_mm_scale(self, value: float, axis: str):
@@ -1847,12 +2198,57 @@ class CameraApp(QtWidgets.QMainWindow):
         self.gain_value_label.setText(str(int(value)))
 
     def _display_frame(self, payload: FramePayload):
+        raw_np = getattr(payload, "np_image_raw", None)
+        if raw_np is None:
+            raw_np = payload.np_image
+        payload.np_image = raw_np
+        payload.pil_image = self._np_to_pil_image(raw_np)
+        self._last_fft_timings = None
         if getattr(self, "_fft_enabled", False):
-            from beam_profile_fitting import fft_clean_image
-            # Process the raw numpy data to remove fringes
-            payload.np_image = fft_clean_image(payload.np_image)
-            # Update the PIL image for display
-            payload.pil_image = Image.fromarray(payload.np_image.astype(np.uint8))
+            try:
+                from beam_profile_fitting import fft_clean_image_steps
+                mask_radius = int(getattr(self, "fft_mask_radius_spin", None).value()) if getattr(self, "fft_mask_radius_spin", None) else 8
+                threshold_sigma = float(getattr(self, "fft_sigma_spin", None).value()) if getattr(self, "fft_sigma_spin", None) else 5.0
+                dc_radius = int(getattr(self, "fft_dc_radius_spin", None).value()) if getattr(self, "fft_dc_radius_spin", None) else 10
+                pair_tol = int(getattr(self, "fft_pair_tol_spin", None).value()) if getattr(self, "fft_pair_tol_spin", None) else 2
+                min_sep = int(getattr(self, "fft_min_sep_spin", None).value()) if getattr(self, "fft_min_sep_spin", None) else 10
+                max_pairs = int(getattr(self, "fft_max_pairs_spin", None).value()) if getattr(self, "fft_max_pairs_spin", None) else 80
+                cleaned, steps = fft_clean_image_steps(
+                    raw_np,
+                    mask_radius=mask_radius,
+                    threshold_sigma=threshold_sigma,
+                    dc_radius=dc_radius,
+                    pair_tol=pair_tol,
+                    min_sep=min_sep,
+                    max_pairs=max_pairs,
+                )
+                if steps:
+                    self._last_fft_timings = steps.get("timings")
+                payload.np_image = cleaned
+                payload.pil_image = Image.fromarray(np.clip(cleaned, 0, 255).astype(np.uint8))
+                if getattr(self, "_fft_steps_enabled", False):
+                    self._update_fft_step_windows(steps)
+                elif steps and getattr(self, "fft_timing_label", None):
+                    timings = steps.get("timings")
+                    if timings:
+                        backend = timings.get("backend", "cpu")
+                        if backend == "gpu":
+                            parts = [
+                                f"gpu upload {timings.get('upload_ms', 0.0):.1f}ms",
+                                f"fft {timings.get('fft_ms', 0.0):.1f}ms",
+                                f"mask {timings.get('mask_ms', 0.0):.1f}ms",
+                                f"ifft {timings.get('ifft_ms', 0.0):.1f}ms",
+                                f"download {timings.get('download_ms', 0.0):.1f}ms",
+                            ]
+                        else:
+                            parts = [
+                                f"cpu fft {timings.get('fft_ms', 0.0):.1f}ms",
+                                f"mask {timings.get('mask_ms', 0.0):.1f}ms",
+                                f"ifft {timings.get('ifft_ms', 0.0):.1f}ms",
+                            ]
+                        self.fft_timing_label.setText("FFT timing: " + ", ".join(parts))
+            except Exception as exc:
+                self.status_label.setText(f"FFT clean failed: {exc}")
         self.last_payload = payload
         self._filtered_np_image_untransformed = self._apply_image_filter_np(payload.np_image)
         self._rebuild_view_transforms()
@@ -1863,6 +2259,17 @@ class CameraApp(QtWidgets.QMainWindow):
             self.image_label.clear()
             self._last_render_scale = 1.0
             self._update_histogram_window(None)
+            if self._fft_toggle_log_pending:
+                pending = self._fft_toggle_log_pending
+                self._fft_toggle_log_pending = None
+                elapsed_ms = (time.perf_counter() - pending["start"]) * 1000.0
+                self._log_fft_timing(
+                    pending["action"],
+                    elapsed_ms,
+                    None,
+                    None,
+                    note="no_frame",
+                )
             return
         img = self._prepare_display_image(self.last_payload)
         if self.cross_pos:
@@ -1872,6 +2279,18 @@ class CameraApp(QtWidgets.QMainWindow):
         self.image_label.setPixmap(pixmap)
         self.image_label.adjustSize()
         self._update_histogram_window(self.last_payload)
+        if self._fft_toggle_log_pending:
+            pending = self._fft_toggle_log_pending
+            self._fft_toggle_log_pending = None
+            elapsed_ms = (time.perf_counter() - pending["start"]) * 1000.0
+            timings = self._last_fft_timings if self._fft_enabled else None
+            self._log_fft_timing(
+                pending["action"],
+                elapsed_ms,
+                self.last_payload,
+                timings,
+                note="refresh_done",
+            )
 
     def _render_pixmap(self, image: Image.Image) -> tuple[QtGui.QPixmap, float]:
         base_pixmap = self._pil_to_qpixmap(image)
@@ -1963,6 +2382,34 @@ class CameraApp(QtWidgets.QMainWindow):
         else:
             self.fit_window.hide()
 
+    def toggle_fit_plots_window(self, state: int):
+        try:
+            checked = QtCore.Qt.CheckState(state) == QtCore.Qt.CheckState.Checked
+        except Exception:
+            checked = bool(state)
+        if not getattr(self, "fit_plots_window", None):
+            return
+        if checked:
+            if not self._fit_plots_window_positioned:
+                anchor_geom = None
+                if getattr(self, "fit_window", None) and self.fit_window.isVisible():
+                    fit_geom = self.fit_window.frameGeometry()
+                    if fit_geom.isValid():
+                        anchor_geom = fit_geom
+                if anchor_geom is None and getattr(self, "controls_window", None):
+                    ctrl_geom = self.controls_window.frameGeometry()
+                    if ctrl_geom.isValid():
+                        anchor_geom = ctrl_geom
+                self._position_window_near_main(
+                    self.fit_plots_window, QtCore.QPoint(18, 0 if anchor_geom else 160), anchor_geom=anchor_geom
+                )
+                self._fit_plots_window_positioned = True
+            if not self.fit_plots_window.isVisible():
+                self.fit_plots_window.show()
+            self.fit_plots_window.raise_()
+        else:
+            self.fit_plots_window.hide()
+
     def toggle_filters_window(self, state: int):
         try:
             checked = QtCore.Qt.CheckState(state) == QtCore.Qt.CheckState.Checked
@@ -1986,6 +2433,24 @@ class CameraApp(QtWidgets.QMainWindow):
             self.filters_window.raise_()
         else:
             self.filters_window.hide()
+
+    def toggle_fft_steps(self, state: int):
+        try:
+            checked = QtCore.Qt.CheckState(state) == QtCore.Qt.CheckState.Checked
+        except Exception:
+            checked = bool(state)
+        self._fft_steps_enabled = checked
+        self._save_fft_settings()
+        if checked:
+            self._show_fft_step_windows()
+            if self.last_payload and self._fft_enabled:
+                self._display_frame(self.last_payload)
+            else:
+                for label in (self.fft_mag_label, self.fft_mask_label, self.fft_ifft_label):
+                    if label:
+                        label.setText("Enable Clean FFT to populate.")
+        else:
+            self._hide_fft_step_windows()
 
     def toggle_measure_window(self, state: int):
         try:
@@ -2682,7 +3147,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self._line_profile = None
         self._line_fit = None
         self._sync_panning_enabled()
-        self.line_fit_status.setText("Line fit: drag endpoints or line, then press SciPy Fit.")
+        self.line_fit_status.setText("Line fit: drag endpoints or line, then press Run Line Fit.")
         self.line_plot_label.clear()
         self._refresh_image_view()
 
@@ -3429,6 +3894,21 @@ class CameraApp(QtWidgets.QMainWindow):
 
 
     @staticmethod
+    def _scale_to_uint8(array: np.ndarray) -> np.ndarray:
+        arr = np.asarray(array, dtype=np.float64)
+        if arr.size == 0:
+            return np.zeros((1, 1), dtype=np.uint8)
+        finite = np.isfinite(arr)
+        if not np.any(finite):
+            return np.zeros(arr.shape, dtype=np.uint8)
+        vmin = float(np.min(arr[finite]))
+        vmax = float(np.max(arr[finite]))
+        if vmax - vmin < 1e-12:
+            return np.zeros(arr.shape, dtype=np.uint8)
+        norm = (arr - vmin) / (vmax - vmin)
+        return np.clip(norm * 255.0, 0, 255).astype(np.uint8)
+
+    @staticmethod
     def _np_to_pil_image(array: np.ndarray) -> Image.Image:
         arr = np.asarray(array)
         if arr.ndim == 2:
@@ -3440,6 +3920,51 @@ class CameraApp(QtWidgets.QMainWindow):
                 arr = np.clip(np.rint(arr), 0, 255).astype(np.uint8)
             return Image.fromarray(arr, mode="RGB")
         raise ValueError("Unsupported array shape for conversion to PIL")
+
+    def _update_fft_step_windows(self, steps: dict | None):
+        if not steps:
+            return
+        mag = steps.get("fft_mag")
+        mask = steps.get("mask")
+        cleaned = steps.get("cleaned")
+        timings = steps.get("timings")
+
+        if mag is not None and getattr(self, "fft_mag_label", None):
+            mag_log = np.log1p(np.abs(mag))
+            mag_u8 = self._scale_to_uint8(mag_log)
+            img = Image.fromarray(mag_u8, mode="L")
+            self.fft_mag_label.setPixmap(self._pil_to_qpixmap(img))
+
+        if mag is not None and mask is not None and getattr(self, "fft_mask_label", None):
+            mag_log = np.log1p(np.abs(mag))
+            base = self._scale_to_uint8(mag_log)
+            rgb = np.stack([base, base, base], axis=2)
+            rgb[mask <= 0] = (255, 0, 0)
+            img = Image.fromarray(rgb.astype(np.uint8), mode="RGB")
+            self.fft_mask_label.setPixmap(self._pil_to_qpixmap(img))
+
+        if cleaned is not None and getattr(self, "fft_ifft_label", None):
+            cleaned_u8 = self._scale_to_uint8(cleaned)
+            img = Image.fromarray(cleaned_u8, mode="L")
+            self.fft_ifft_label.setPixmap(self._pil_to_qpixmap(img))
+
+        if timings and getattr(self, "fft_timing_label", None):
+            backend = timings.get("backend", "cpu")
+            if backend == "gpu":
+                parts = [
+                    f"gpu upload {timings.get('upload_ms', 0.0):.1f}ms",
+                    f"fft {timings.get('fft_ms', 0.0):.1f}ms",
+                    f"mask {timings.get('mask_ms', 0.0):.1f}ms",
+                    f"ifft {timings.get('ifft_ms', 0.0):.1f}ms",
+                    f"download {timings.get('download_ms', 0.0):.1f}ms",
+                ]
+            else:
+                parts = [
+                    f"cpu fft {timings.get('fft_ms', 0.0):.1f}ms",
+                    f"mask {timings.get('mask_ms', 0.0):.1f}ms",
+                    f"ifft {timings.get('ifft_ms', 0.0):.1f}ms",
+                ]
+            self.fft_timing_label.setText("FFT timing: " + ", ".join(parts))
 
     def _prepare_display_image(self, payload: FramePayload) -> Image.Image:
         base_np = self._display_np_image
@@ -4079,178 +4604,6 @@ class CameraApp(QtWidgets.QMainWindow):
         self._line_edit_mode = False
         self._sync_panning_enabled()
 
-    def run_scipy_fit(self):
-        if not self.last_payload:
-            self.axis_fit_status.setText("SciPy fit: no image.")
-            return
-        data = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
-        if data.ndim == 3:
-            data = np.mean(data, axis=2)
-        center_stats = self._moment_center_and_cov(data)
-        if center_stats is None:
-            self.axis_fit_status.setText("SciPy fit failed: no signal for centroid.")
-            return
-        mu_x, mu_y, _, _, _ = center_stats
-        h, w = data.shape
-        cx = int(round(np.clip(mu_x, 0, w - 1)))
-        cy = int(round(np.clip(mu_y, 0, h - 1)))
-
-        try:
-            res_h = gaussian_or_lorentzian_aic(np.arange(w, dtype=float), data[cy, :], mode="auto")[0]
-            res_v = gaussian_or_lorentzian_aic(np.arange(h, dtype=float), data[:, cx], mode="auto")[0]
-        except Exception as exc:
-            self.axis_fit_status.setText(f"SciPy fit failed: {exc}")
-            return
-
-        def _metrics(res, x_axis: np.ndarray, profile: np.ndarray, px_step: float, mm_step: float):
-            model = res["best_model"]
-            width_param = float(res["p_best"][2])
-            if model == "gaussian":
-                sigma_px = width_param
-                fwhm_px = 2.3548 * sigma_px
-                w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
-            else:
-                gamma_px = width_param
-                fwhm_px = gamma_px
-                w1e2_px = gamma_px  # approximate radius with FWHM for overlay consistency
-            fwhm_mm = fwhm_px * px_step if model == "gaussian" else fwhm_px * px_step
-            w1e2_mm = w1e2_px * px_step
-            return {
-                "model": model,
-                "width_px": width_param,
-                "fwhm_px": fwhm_px,
-                "fwhm_mm": fwhm_mm,
-                "w1e2_px": w1e2_px,
-                "w1e2_mm": w1e2_mm,
-                "fit_curve": res["yhat_best"],
-                "profile": profile,
-                "px_axis": x_axis,
-                "r2": res.get("r2_best", 0.0),
-            }
-
-        x_axis_h = np.arange(w, dtype=float)
-        x_axis_v = np.arange(h, dtype=float)
-        fit_h = _metrics(res_h, x_axis_h, data[cy, :], self.mm_per_px_x, self.mm_per_px_x)
-        fit_v = _metrics(res_v, x_axis_v, data[:, cx], self.mm_per_px_y, self.mm_per_px_y)
-
-        self._axis_lines = [
-            ((0, cy), (w - 1, cy), QtGui.QColor(0, 200, 255)),
-            ((cx, 0), (cx, h - 1), QtGui.QColor(255, 120, 0)),
-        ]
-        self._axis_fit_results = {"H": fit_h, "V": fit_v}
-        self._axis_center_px = (float(cx), float(cy))
-        self.cross_pos = (cx, cy)
-
-        self._update_axis_plot(
-            self.axis_plot_h,
-            "Horizontal profile (cyan) + fit (orange)",
-            fit_h["px_axis"],
-            fit_h["profile"],
-            fit_h["fit_curve"],
-            (fit_h["px_axis"][-1] - fit_h["px_axis"][0] if fit_h["px_axis"].size else 0) * self.mm_per_px_x,
-            fit_h["fwhm_mm"],
-            fit_h["w1e2_mm"],
-        )
-        self._update_axis_plot(
-            self.axis_plot_v,
-            "Vertical profile (cyan) + fit (orange)",
-            fit_v["px_axis"],
-            fit_v["profile"],
-            fit_v["fit_curve"],
-            (fit_v["px_axis"][-1] - fit_v["px_axis"][0] if fit_v["px_axis"].size else 0) * self.mm_per_px_y,
-            fit_v["fwhm_mm"],
-            fit_v["w1e2_mm"],
-        )
-
-        self.axis_fit_status.setText(
-            "SciPy fit: "
-            f"H model={fit_h['model']} FWHM={fit_h['fwhm_px']:.2f}px ({fit_h['fwhm_mm']:.3f}mm); "
-            f"V model={fit_v['model']} FWHM={fit_v['fwhm_px']:.2f}px ({fit_v['fwhm_mm']:.3f}mm)"
-        )
-        self._pending_sections["horizontal"] = (fit_h["px_axis"], fit_h["profile"])
-        self._pending_sections["vertical"] = (fit_v["px_axis"], fit_v["profile"])
-
-        # Optional: run SciPy on the user-defined line if two points are set.
-        if len(self._line_points) == 2:
-            sampled = self._sample_line_profile(self._line_points[0], self._line_points[1])
-            if sampled is None:
-                self.line_fit_status.setText("Line fit failed: points are identical.")
-            else:
-                px_axis, raw_profile, filtered_profile, length_px, length_mm = sampled
-                try:
-                    res_line = gaussian_or_lorentzian_aic(px_axis, filtered_profile, mode="auto")[0]
-                except Exception as exc:
-                    self.line_fit_status.setText(f"SciPy line fit failed: {exc}")
-                else:
-                    model = res_line["best_model"]
-                    width_param = float(res_line["p_best"][2])
-                    mu_pos_px = float(res_line["p_best"][1])
-                    if length_px > 0:
-                        mu_pos_mm = mu_pos_px / length_px * length_mm
-                    else:
-                        mu_pos_mm = 0.0
-                    if model == "gaussian":
-                        sigma_px = width_param
-                        fwhm_px = 2.3548 * sigma_px
-                        w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
-                    else:
-                        gamma_px = width_param
-                        fwhm_px = gamma_px
-                        w1e2_px = gamma_px
-                    px_step_line = length_px / max(len(px_axis) - 1, 1)
-                    mm_step_line = length_mm / max(len(px_axis) - 1, 1)
-                    mm_per_px_line = (mm_step_line / px_step_line) if px_step_line > 0 else 0.0
-                    fwhm_mm = fwhm_px * mm_per_px_line
-                    w1e2_mm = w1e2_px * mm_per_px_line
-
-                    fit_curve = res_line["yhat_best"]
-                    self._line_profile = (px_axis, raw_profile, filtered_profile)
-                    self._line_fit = {
-                        "model": model,
-                        "width_px": width_param,
-                        "fwhm_px": fwhm_px,
-                        "fwhm_mm": fwhm_mm,
-                        "w1e2_px": w1e2_px,
-                        "w1e2_mm": w1e2_mm,
-                        "mu_px": mu_pos_px,
-                        "mu_mm": mu_pos_mm,
-                        "r2": res_line.get("r2_best", 0.0),
-                    }
-                    self._update_line_plot(
-                        px_axis,
-                        filtered_profile,
-                        fit_curve,
-                        length_mm,
-                        fwhm_mm,
-                        w1e2_mm,
-                        raw_profile=raw_profile,
-                    )
-                    self.line_fit_status.setText(
-                        f"SciPy line fit ({model}): "
-                        f"mu={mu_pos_px:.2f}px ({mu_pos_mm:.3f}mm), "
-                        f"FWHM={fwhm_px:.2f}px ({fwhm_mm:.3f}mm), "
-                        f"1/e^2={w1e2_px:.2f}px ({w1e2_mm:.3f}mm), "
-                        f"R^2={self._line_fit['r2']:.3f}"
-                    )
-                    self._pending_sections["line"] = (px_axis, raw_profile)
-        else:
-            self.line_fit_status.setText("Line fit: select two points, then press SciPy Fit.")
-
-        self._gauss_fit = {
-            "mu_x": cx,
-            "mu_y": cy,
-            "w1e2_major": fit_h["w1e2_px"],
-            "w1e2_minor": fit_v["w1e2_px"],
-            "w1e2_major_mm": fit_h["w1e2_mm"],
-            "w1e2_minor_mm": fit_v["w1e2_mm"],
-            "angle_deg": 0.0,
-            "waist_ratio": (fit_h["w1e2_mm"] / fit_v["w1e2_mm"]) if fit_v["w1e2_mm"] else 0.0,
-            "label_text": f"{fit_h['w1e2_px']*2:.2f}px ({fit_h['w1e2_mm']*2:.3f}mm) x {fit_v['w1e2_px']*2:.2f}px ({fit_v['w1e2_mm']*2:.3f}mm) | ratio {(fit_h['w1e2_mm'] / fit_v['w1e2_mm']) if fit_v['w1e2_mm'] else 0.0:.3f}",
-        }
-        self._refresh_image_view()
-        self._line_edit_mode = False
-        self._sync_panning_enabled()
-
     def eventFilter(self, obj, event):
         if obj is getattr(self, "hist_window", None):
             if event.type() == QtCore.QEvent.Type.Resize:
@@ -4264,9 +4617,21 @@ class CameraApp(QtWidgets.QMainWindow):
         elif obj is getattr(self, "fit_window", None):
             if event.type() == QtCore.QEvent.Type.Move:
                 self._fit_window_positioned = True
+        elif obj is getattr(self, "fit_plots_window", None):
+            if event.type() == QtCore.QEvent.Type.Move:
+                self._fit_plots_window_positioned = True
         elif obj is getattr(self, "filters_window", None):
             if event.type() == QtCore.QEvent.Type.Move:
                 self._filters_window_positioned = True
+        elif obj is getattr(self, "fft_mag_window", None):
+            if event.type() == QtCore.QEvent.Type.Move:
+                self._fft_mag_window_positioned = True
+        elif obj is getattr(self, "fft_mask_window", None):
+            if event.type() == QtCore.QEvent.Type.Move:
+                self._fft_mask_window_positioned = True
+        elif obj is getattr(self, "fft_ifft_window", None):
+            if event.type() == QtCore.QEvent.Type.Move:
+                self._fft_ifft_window_positioned = True
         elif obj is getattr(self, "calibration_window", None):
             if event.type() == QtCore.QEvent.Type.Move:
                 self._calibration_window_positioned = True
@@ -4470,7 +4835,7 @@ class CameraApp(QtWidgets.QMainWindow):
         try:
             img = Image.open(path)
             np_img = np.array(img)
-            payload = FramePayload(pil_image=img, np_image=np_img, frame_count=-1)
+            payload = FramePayload(pil_image=img, np_image=np_img, np_image_raw=np_img, frame_count=-1)
             self.cross_pos = None
             self._display_frame(payload)
             self.status_label.setText(f"Loaded {path}")
@@ -4551,7 +4916,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self._line_fit = None
         self._axis_lines = []
         self._axis_fit_results = {}
-        self.line_fit_status.setText("Line fit: click first point, then second, then press SciPy Fit.")
+        self.line_fit_status.setText("Line fit: click first point, then second, then press Run Line Fit.")
         self.line_plot_label.clear()
         self.axis_fit_status.setText("360 fit: not computed.")
         self.axis_plot_h.clear()
@@ -4817,9 +5182,21 @@ class CameraApp(QtWidgets.QMainWindow):
             if getattr(self, "fit_window", None):
                 self._save_window_state(self.fit_window, "fit_window")
                 self.fit_window.close()
+            if getattr(self, "fit_plots_window", None):
+                self._save_window_state(self.fit_plots_window, "fit_plots_window")
+                self.fit_plots_window.close()
             if getattr(self, "filters_window", None):
                 self._save_window_state(self.filters_window, "filters_window")
                 self.filters_window.close()
+            if getattr(self, "fft_mag_window", None):
+                self._save_window_state(self.fft_mag_window, "fft_mag_window")
+                self.fft_mag_window.close()
+            if getattr(self, "fft_mask_window", None):
+                self._save_window_state(self.fft_mask_window, "fft_mask_window")
+                self.fft_mask_window.close()
+            if getattr(self, "fft_ifft_window", None):
+                self._save_window_state(self.fft_ifft_window, "fft_ifft_window")
+                self.fft_ifft_window.close()
             if getattr(self, "calibration_window", None):
                 self._save_window_state(self.calibration_window, "calibration_window")
                 self.calibration_window.close()

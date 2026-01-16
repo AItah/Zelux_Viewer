@@ -6,18 +6,27 @@ from __future__ import annotations
 
 import math
 from typing import Iterable, Literal, Optional
+import time
 
 import numpy as np
 
 try:
     from scipy.optimize import least_squares
-    from scipy.fft import fft2, ifft2, fftshift, ifftshift
+    from scipy import fft as scipy_fft
 
     _HAVE_SCIPY = True
 except Exception:  # pragma: no cover - import fallback
     _HAVE_SCIPY = False
     least_squares = None  # type: ignore[assignment]
-    fft2 = ifft2 = fftshift = ifftshift = None  # type: ignore[assignment]
+    scipy_fft = None  # type: ignore[assignment]
+
+try:
+    import cupy as cp  # Optional GPU acceleration
+
+    _HAVE_CUPY = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAVE_CUPY = False
+    cp = None  # type: ignore[assignment]
 
 def gaussian_2d(p, xy):
     """2D Rotated Gaussian model: [I0, x0, y0, wx, wy, theta, c, ax, ay]."""
@@ -34,29 +43,228 @@ def gaussian_2d(p, xy):
     bg = c + ax * x + ay * y
     return g + bg
 
-def _fft_clean_channel(channel: np.ndarray, mask_radius: int, threshold_sigma: float) -> np.ndarray:
-    img_float = channel.astype(np.float32)
-    f = fftshift(fft2(img_float))
-    mag = np.abs(f)
-
-    rows, cols = channel.shape
+def _build_fft_mask_from_mag(
+    mag: np.ndarray,
+    mask_radius: int,
+    threshold_sigma: float,
+    dc_radius: int = 10,
+    pair_tol: int = 2,
+    min_sep: int = 0,
+    max_pairs: int = 80,
+) -> np.ndarray:
+    rows, cols = mag.shape
     crow, ccol = rows // 2, cols // 2
-    mag_no_dc = mag.copy()
-    mag_no_dc[crow - 10 : crow + 10, ccol - 10 : ccol + 10] = 0
+    mag_log = np.log1p(np.abs(mag))
 
-    avg, std = np.mean(mag_no_dc), np.std(mag_no_dc)
+    yy, xx = np.indices(mag_log.shape)
+    rr = np.sqrt((xx - ccol) ** 2 + (yy - crow) ** 2).astype(np.int32)
+    rr_flat = rr.ravel()
+    mag_flat = mag_log.ravel()
+    counts = np.bincount(rr_flat)
+    sums = np.bincount(rr_flat, weights=mag_flat)
+    sums_sq = np.bincount(rr_flat, weights=mag_flat * mag_flat)
+    valid = counts > 0
+    mean = np.zeros_like(sums)
+    mean[valid] = sums[valid] / counts[valid]
+    var = np.zeros_like(sums)
+    var[valid] = sums_sq[valid] / counts[valid] - mean[valid] ** 2
+    std = np.sqrt(np.maximum(var, 1e-12))
+    nonzero_std = std[valid]
+    if nonzero_std.size:
+        floor_std = np.median(nonzero_std) * 0.35
+        if not np.isfinite(floor_std) or floor_std <= 0:
+            floor_std = 1e-6
+    else:
+        floor_std = 1e-6
+    std = np.maximum(std, floor_std)
+
+    z_map = (mag_log - mean[rr]) / std[rr]
+    z_map[crow - dc_radius : crow + dc_radius + 1, ccol - dc_radius : ccol + dc_radius + 1] = 0.0
+
+    threshold = float(threshold_sigma)
+
+    pad = np.pad(z_map, 1, mode="constant", constant_values=-np.inf)
+    center = pad[1:-1, 1:-1]
+    neigh_max = np.maximum.reduce(
+        [
+            pad[:-2, :-2],
+            pad[:-2, 1:-1],
+            pad[:-2, 2:],
+            pad[1:-1, :-2],
+            pad[1:-1, 2:],
+            pad[2:, :-2],
+            pad[2:, 1:-1],
+            pad[2:, 2:],
+        ]
+    )
+    local_max = center >= neigh_max
+    candidate = (center > threshold) & local_max
+    cand_r, cand_c = np.where(candidate)
+    if cand_r.size == 0:
+        return np.ones_like(mag)
+
+    cand_mag = z_map[cand_r, cand_c]
+    order = np.argsort(-cand_mag)
+    cand_r = cand_r[order]
+    cand_c = cand_c[order]
+
+    cand_map = np.zeros_like(candidate, dtype=bool)
+    cand_map[cand_r, cand_c] = True
+
+    pair_list: list[tuple[float, tuple[int, int], tuple[int, int]]] = []
+    seen_pairs = set()
+    for r, c in zip(cand_r, cand_c):
+        sym_r = 2 * crow - r
+        sym_c = 2 * ccol - c
+        r0 = int(round(sym_r))
+        c0 = int(round(sym_c))
+        found = None
+        for rr in range(r0 - pair_tol, r0 + pair_tol + 1):
+            if rr < 0 or rr >= rows:
+                continue
+            for cc in range(c0 - pair_tol, c0 + pair_tol + 1):
+                if cc < 0 or cc >= cols:
+                    continue
+                if cand_map[rr, cc]:
+                    found = (rr, cc)
+                    break
+            if found:
+                break
+        if not found:
+            continue
+        a = (int(r), int(c))
+        b = (int(found[0]), int(found[1]))
+        key = tuple(sorted((a, b)))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        score = float(z_map[a[0], a[1]] + z_map[b[0], b[1]])
+        pair_list.append((score, a, b))
+
+    pair_list.sort(key=lambda t: t[0], reverse=True)
+
+    min_sep = max(0, int(min_sep))
+    min_sep2 = float(min_sep * min_sep)
+    selected_points: list[tuple[int, int]] = []
+    selected_pairs: list[tuple[tuple[int, int], tuple[int, int]]] = []
+
+    for _, p1, p2 in pair_list:
+        if max_pairs and len(selected_pairs) >= max_pairs:
+            break
+        if min_sep > 0:
+            too_close = False
+            for sp in selected_points:
+                if (p1[0] - sp[0]) ** 2 + (p1[1] - sp[1]) ** 2 < min_sep2:
+                    too_close = True
+                    break
+                if (p2[0] - sp[0]) ** 2 + (p2[1] - sp[1]) ** 2 < min_sep2:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+        selected_pairs.append((p1, p2))
+        selected_points.extend([p1, p2])
+
     mask = np.ones_like(mag)
-    peaks = np.where(mag_no_dc > avg + threshold_sigma * std)
+    for p1, p2 in selected_pairs:
+        for r, c in (p1, p2):
+            y, x = np.ogrid[-r : rows - r, -c : cols - c]
+            mask[x * x + y * y <= mask_radius**2] = 0
+    return mask
 
-    for r, c in zip(peaks[0], peaks[1]):
-        y, x = np.ogrid[-r : rows - r, -c : cols - c]
-        mask[x * x + y * y <= mask_radius**2] = 0
 
+def _fft_clean_channel(
+    channel: np.ndarray,
+    mask_radius: int,
+    threshold_sigma: float,
+    dc_radius: int,
+    pair_tol: int,
+    min_sep: int,
+    max_pairs: int,
+    return_steps: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, dict] | np.ndarray:
+    timings: dict[str, float | str] = {}
+    if _HAVE_CUPY:
+        try:
+            t0 = time.perf_counter()
+            channel_gpu = cp.asarray(channel, dtype=cp.float32)
+            cp.cuda.Stream.null.synchronize()
+            t_upload = time.perf_counter()
+            f = cp.fft.fftshift(cp.fft.fft2(channel_gpu))
+            cp.cuda.Stream.null.synchronize()
+            t_fft = time.perf_counter()
+            mag_gpu = cp.abs(f)
+            mag = cp.asnumpy(mag_gpu)
+            t_mag = time.perf_counter()
+            mask = _build_fft_mask_from_mag(
+                mag,
+                mask_radius,
+                threshold_sigma,
+                dc_radius=dc_radius,
+                pair_tol=pair_tol,
+                min_sep=min_sep,
+                max_pairs=max_pairs,
+            )
+            t_mask = time.perf_counter()
+            f_clean = f * cp.asarray(mask)
+            cleaned = cp.abs(cp.fft.ifft2(cp.fft.ifftshift(f_clean)))
+            cp.cuda.Stream.null.synchronize()
+            t_ifft = time.perf_counter()
+            cleaned_np = cp.asnumpy(cleaned)
+            t_download = time.perf_counter()
+            timings = {
+                "backend": "gpu",
+                "upload_ms": (t_upload - t0) * 1000.0,
+                "fft_ms": (t_fft - t_upload) * 1000.0,
+                "mag_download_ms": (t_mag - t_fft) * 1000.0,
+                "mask_ms": (t_mask - t_mag) * 1000.0,
+                "ifft_ms": (t_ifft - t_mask) * 1000.0,
+                "download_ms": (t_download - t_ifft) * 1000.0,
+            }
+            if return_steps:
+                return cleaned_np, mag, mask, timings
+            return cleaned_np
+        except Exception:
+            pass
+
+    img_float = channel.astype(np.float32)
+    t0 = time.perf_counter()
+    f = scipy_fft.fftshift(scipy_fft.fft2(img_float, workers=-1))
+    t_fft = time.perf_counter()
+    mag = np.abs(f)
+    mask = _build_fft_mask_from_mag(
+        mag,
+        mask_radius,
+        threshold_sigma,
+        dc_radius=dc_radius,
+        pair_tol=pair_tol,
+        min_sep=min_sep,
+        max_pairs=max_pairs,
+    )
+    t_mask = time.perf_counter()
     f_clean = f * mask
-    return np.abs(ifft2(ifftshift(f_clean)))
+    cleaned = np.abs(scipy_fft.ifft2(scipy_fft.ifftshift(f_clean), workers=-1))
+    t_ifft = time.perf_counter()
+    timings = {
+        "backend": "cpu",
+        "fft_ms": (t_fft - t0) * 1000.0,
+        "mask_ms": (t_mask - t_fft) * 1000.0,
+        "ifft_ms": (t_ifft - t_mask) * 1000.0,
+    }
+    if return_steps:
+        return cleaned, mag, mask, timings
+    return cleaned
 
 
-def fft_clean_image(image, mask_radius=8, threshold_sigma=5):
+def fft_clean_image(
+    image,
+    mask_radius=8,
+    threshold_sigma=5,
+    dc_radius=10,
+    pair_tol=2,
+    min_sep=0,
+    max_pairs=80,
+):
     """
     Fast algorithm to remove periodic interference fringes using 2D FFT.
     Identifies high-frequency peaks and applies a notch filter.
@@ -66,13 +274,61 @@ def fft_clean_image(image, mask_radius=8, threshold_sigma=5):
 
     img = np.asarray(image)
     if img.ndim == 2:
-        return _fft_clean_channel(img, mask_radius, threshold_sigma)
+        return _fft_clean_channel(img, mask_radius, threshold_sigma, dc_radius, pair_tol, min_sep, max_pairs)
     if img.ndim == 3:
         cleaned = [
-            _fft_clean_channel(img[:, :, ch], mask_radius, threshold_sigma)
+            _fft_clean_channel(img[:, :, ch], mask_radius, threshold_sigma, dc_radius, pair_tol, min_sep, max_pairs)
             for ch in range(img.shape[2])
         ]
         return np.stack(cleaned, axis=2)
+    raise ValueError("Unsupported image shape for FFT cleaning.")
+
+
+def fft_clean_image_steps(
+    image,
+    mask_radius=8,
+    threshold_sigma=5,
+    dc_radius=10,
+    pair_tol=2,
+    min_sep=0,
+    max_pairs=80,
+):
+    """Return cleaned image and FFT debug steps (magnitude, mask, cleaned preview)."""
+    if not _HAVE_SCIPY:
+        raise RuntimeError("SciPy not available. Install scipy to use fft_clean_image_steps.")
+
+    img = np.asarray(image)
+    if img.ndim == 2:
+        cleaned, mag, mask, timings = _fft_clean_channel(
+            img, mask_radius, threshold_sigma, dc_radius, pair_tol, min_sep, max_pairs, return_steps=True
+        )
+        return cleaned, {"fft_mag": mag, "mask": mask, "cleaned": cleaned, "timings": timings}
+    if img.ndim == 3:
+        cleaned_channels = []
+        mag = None
+        mask = None
+        cleaned_preview = None
+        timings = None
+        for ch in range(img.shape[2]):
+            if ch == 0:
+                cleaned_ch, mag, mask, timings = _fft_clean_channel(
+                    img[:, :, ch],
+                    mask_radius,
+                    threshold_sigma,
+                    dc_radius,
+                    pair_tol,
+                    min_sep,
+                    max_pairs,
+                    return_steps=True,
+                )
+                cleaned_preview = cleaned_ch
+            else:
+                cleaned_ch = _fft_clean_channel(
+                    img[:, :, ch], mask_radius, threshold_sigma, dc_radius, pair_tol, min_sep, max_pairs
+                )
+            cleaned_channels.append(cleaned_ch)
+        cleaned = np.stack(cleaned_channels, axis=2)
+        return cleaned, {"fft_mag": mag, "mask": mask, "cleaned": cleaned_preview, "timings": timings}
     raise ValueError("Unsupported image shape for FFT cleaning.")
 
 def fit_gaussian_2d(image):
