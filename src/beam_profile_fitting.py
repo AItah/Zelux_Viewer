@@ -11,11 +11,116 @@ import numpy as np
 
 try:
     from scipy.optimize import least_squares
+    from scipy.fft import fft2, ifft2, fftshift, ifftshift
 
     _HAVE_SCIPY = True
 except Exception:  # pragma: no cover - import fallback
     _HAVE_SCIPY = False
+    least_squares = None  # type: ignore[assignment]
+    fft2 = ifft2 = fftshift = ifftshift = None  # type: ignore[assignment]
 
+def gaussian_2d(p, xy):
+    """2D Rotated Gaussian model: [I0, x0, y0, wx, wy, theta, c, ax, ay]."""
+    I0, x0, y0, wx, wy, theta, c, ax, ay = p
+    x, y = xy
+    
+    # Rotation relative to center (x0, y0)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    x_rot = (x - x0) * cos_t - (y - y0) * sin_t
+    y_rot = (x - x0) * sin_t + (y - y0) * cos_t
+    
+    # Gaussian + Tilted Background Plane
+    g = I0 * np.exp(-2 * (x_rot**2 / (wx**2) + y_rot**2 / (wy**2)))
+    bg = c + ax * x + ay * y
+    return g + bg
+
+def _fft_clean_channel(channel: np.ndarray, mask_radius: int, threshold_sigma: float) -> np.ndarray:
+    img_float = channel.astype(np.float32)
+    f = fftshift(fft2(img_float))
+    mag = np.abs(f)
+
+    rows, cols = channel.shape
+    crow, ccol = rows // 2, cols // 2
+    mag_no_dc = mag.copy()
+    mag_no_dc[crow - 10 : crow + 10, ccol - 10 : ccol + 10] = 0
+
+    avg, std = np.mean(mag_no_dc), np.std(mag_no_dc)
+    mask = np.ones_like(mag)
+    peaks = np.where(mag_no_dc > avg + threshold_sigma * std)
+
+    for r, c in zip(peaks[0], peaks[1]):
+        y, x = np.ogrid[-r : rows - r, -c : cols - c]
+        mask[x * x + y * y <= mask_radius**2] = 0
+
+    f_clean = f * mask
+    return np.abs(ifft2(ifftshift(f_clean)))
+
+
+def fft_clean_image(image, mask_radius=8, threshold_sigma=5):
+    """
+    Fast algorithm to remove periodic interference fringes using 2D FFT.
+    Identifies high-frequency peaks and applies a notch filter.
+    """
+    if not _HAVE_SCIPY:
+        raise RuntimeError("SciPy not available. Install scipy to use fft_clean_image.")
+
+    img = np.asarray(image)
+    if img.ndim == 2:
+        return _fft_clean_channel(img, mask_radius, threshold_sigma)
+    if img.ndim == 3:
+        cleaned = [
+            _fft_clean_channel(img[:, :, ch], mask_radius, threshold_sigma)
+            for ch in range(img.shape[2])
+        ]
+        return np.stack(cleaned, axis=2)
+    raise ValueError("Unsupported image shape for FFT cleaning.")
+
+def fit_gaussian_2d(image):
+    """Robust 2D Gaussian fit using image moments for initial guess."""
+    if not _HAVE_SCIPY:
+        raise RuntimeError("SciPy not available. Install scipy to use fit_gaussian_2d.")
+
+    img = np.asarray(image, dtype=float)
+    if img.ndim == 3:
+        img = np.mean(img, axis=2)
+    if img.ndim != 2:
+        raise ValueError("fit_gaussian_2d expects a 2D image.")
+
+    rows, cols = img.shape
+    x = np.arange(cols)
+    y = np.arange(rows)
+    X, Y = np.meshgrid(x, y)
+
+    min_val = float(np.min(img))
+    weights = np.clip(img - min_val, 0.0, None)
+    img_sum = float(np.sum(weights))
+    if img_sum <= 0:
+        return None
+
+    x0_g = float(np.sum(X * weights) / img_sum)
+    y0_g = float(np.sum(Y * weights) / img_sum)
+
+    wx_g = float(np.sqrt(np.sum((X - x0_g) ** 2 * weights) / img_sum) * 2.0)
+    wy_g = float(np.sqrt(np.sum((Y - y0_g) ** 2 * weights) / img_sum) * 2.0)
+    wx_g = max(wx_g, 1e-6)
+    wy_g = max(wy_g, 1e-6)
+
+    max_val = float(np.max(img))
+    I0_g = max(max_val - min_val, np.finfo(float).eps)
+    p0 = [I0_g, x0_g, y0_g, wx_g, wy_g, 0.0, min_val, 0.0, 0.0]
+
+    span = float(max(rows, cols))
+    lb = np.array([0.0, 0.0, 0.0, 1e-6, 1e-6, -0.5 * np.pi, -np.inf, -np.inf, -np.inf], dtype=float)
+    ub = np.array(
+        [np.inf, cols - 1.0, rows - 1.0, 2.0 * span, 2.0 * span, 0.5 * np.pi, np.inf, np.inf, np.inf],
+        dtype=float,
+    )
+
+    def residuals(p):
+        return (gaussian_2d(p, (X, Y)) - img).ravel()
+
+    res = least_squares(residuals, p0, bounds=(lb, ub), ftol=1e-4, xtol=1e-4, max_nfev=20000)
+    return res.x  # Returns [I0, x0, y0, wx, wy, theta, c, ax, ay]
 
 Mode = Literal["auto", "gaussian", "lorentzian"]
 

@@ -574,6 +574,7 @@ class PylonVideoThread(threading.Thread):
 class CameraApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
+        self._fft_enabled = False  # Add this line to track state
         os.makedirs(DATA_DIR, exist_ok=True)
         self.sdk = TLCameraSDK()
         self.camera: Optional[TLCamera] = None
@@ -597,8 +598,10 @@ class CameraApp(QtWidgets.QMainWindow):
         self.mm_per_px_x = 0.00345 # thorlab zelus pixel size
         self.mm_per_px_y = 0.00345 # thorlab zelus pixel size
         self._gauss_fit = None
+        self._gauss_fit_2d = None
         self._hist_window_positioned = False
         self._fit_window_positioned = False
+        self._filters_window_positioned = False
         self._calibration_window_positioned = False
         self._calibration_axis: Optional[str] = None  # "x", "y", or "both" while active
         self._calibration_last_axis: Optional[str] = None  # remember last calibrated axis for overlay
@@ -667,6 +670,88 @@ class CameraApp(QtWidgets.QMainWindow):
         self.poll_timer.timeout.connect(self._poll_queue)
         self.poll_timer.start()
 
+    def _toggle_fft_cleaning(self):
+        self._fft_enabled = self.fft_clean_btn.isChecked()
+        status = "ON" if self._fft_enabled else "OFF"
+        self.fft_clean_btn.setText(f"Clean FFT: {status}")
+        self._refresh_image_view()
+
+    def compute_2d_gaussian_fit(self):
+        """Fit a rotated 2D Gaussian spot on the current image."""
+        if self.last_payload is None:
+            return
+
+        data = self._display_np_image if self._display_np_image is not None else (
+            self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        )
+        if data.ndim == 3:
+            data = np.mean(data, axis=2)
+
+        try:
+            from beam_profile_fitting import fit_gaussian_2d
+            params = fit_gaussian_2d(data)
+        except Exception as exc:
+            self.status_label.setText(f"2D fit failed: {exc}")
+            if getattr(self, "gauss_result_label", None):
+                self.gauss_result_label.setText(f"2D spot fit failed: {exc}")
+            return
+
+        if params is None:
+            self.status_label.setText("2D fit failed: no signal.")
+            if getattr(self, "gauss_result_label", None):
+                self.gauss_result_label.setText("2D spot fit failed: no signal.")
+            return
+
+        I0, x0, y0, wx, wy, theta, c, ax, ay = params
+        wx = float(abs(wx))
+        wy = float(abs(wy))
+        angle = float(theta)
+        if wy > wx:
+            wx, wy = wy, wx
+            angle += 0.5 * np.pi
+        angle = (angle + 0.5 * np.pi) % np.pi - 0.5 * np.pi
+        angle_deg = float(np.degrees(angle))
+
+        scale_major = float(np.hypot(np.cos(angle) * self.mm_per_px_x, np.sin(angle) * self.mm_per_px_y))
+        scale_minor = float(np.hypot(-np.sin(angle) * self.mm_per_px_x, np.cos(angle) * self.mm_per_px_y))
+        w_major_mm = wx * scale_major
+        w_minor_mm = wy * scale_minor
+        waist_ratio = (w_major_mm / w_minor_mm) if w_minor_mm else 0.0
+
+        self._gauss_fit_2d = {
+            "I0": float(I0),
+            "x0": float(x0),
+            "y0": float(y0),
+            "wx": wx,
+            "wy": wy,
+            "theta": angle,
+            "c": float(c),
+            "ax": float(ax),
+            "ay": float(ay),
+        }
+        self._gauss_fit = {
+            "mu_x": float(x0),
+            "mu_y": float(y0),
+            "w1e2_major": wx,
+            "w1e2_minor": wy,
+            "w1e2_major_mm": w_major_mm,
+            "w1e2_minor_mm": w_minor_mm,
+            "angle_deg": angle_deg,
+            "waist_ratio": waist_ratio,
+            "label_text": f"{2*wx:.2f}px ({2*w_major_mm:.3f}mm) x {2*wy:.2f}px ({2*w_minor_mm:.3f}mm) | ratio {waist_ratio:.3f}",
+        }
+        self._axis_center_px = (float(x0), float(y0))
+        self.cross_pos = (int(round(x0)), int(round(y0)))
+        self.status_label.setText(
+            f"2D fit: x0={x0:.1f}, y0={y0:.1f}, w={2*wx:.2f}px x {2*wy:.2f}px, angle={angle_deg:.1f} deg"
+        )
+        if getattr(self, "gauss_result_label", None):
+            self.gauss_result_label.setText(
+                f"2D spot fit: center ({x0:.2f}px, {y0:.2f}px), 1/e^2 diam {2*wx:.2f}px ({2*w_major_mm:.3f}mm) x "
+                f"{2*wy:.2f}px ({2*w_minor_mm:.3f}mm), angle {angle_deg:.1f} deg"
+            )
+        self._refresh_image_view()
+    
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -723,14 +808,24 @@ class CameraApp(QtWidgets.QMainWindow):
         self.fit_window = self._build_fit_window()
         self.fit_window.installEventFilter(self)
 
+        self.filters_window = self._build_filters_window()
+        self.filters_window.installEventFilter(self)
+
         self.calibration_window = self._build_calibration_window()
         self.calibration_window.installEventFilter(self)
 
         self._restore_window_state(self.hist_window, "hist_window")
         self._restore_window_state(self.fit_window, "fit_window")
+        filters_restored = self._restore_window_state(self.filters_window, "filters_window")
         calib_restored = self._restore_window_state(self.calibration_window, "calibration_window")
+        if filters_restored:
+            self._filters_window_positioned = True
         if calib_restored:
             self._calibration_window_positioned = True
+        if getattr(self, "filters_checkbox", None) and self.filters_window.isVisible():
+            self.filters_checkbox.blockSignals(True)
+            self.filters_checkbox.setChecked(True)
+            self.filters_checkbox.blockSignals(False)
         if getattr(self, "measure_checkbox", None) and self.calibration_window.isVisible():
             self.measure_checkbox.blockSignals(True)
             self.measure_checkbox.setChecked(True)
@@ -792,34 +887,6 @@ class CameraApp(QtWidgets.QMainWindow):
         info_label.setStyleSheet("color: #ccc;")
         layout.addWidget(info_label)
 
-        filter_row = QtWidgets.QHBoxLayout()
-        filter_row.addWidget(QtWidgets.QLabel("Profile filter:"))
-        self.filter_mode_combo = QtWidgets.QComboBox()
-        self.filter_mode_combo.addItems(["None", "Low-pass", "High-pass", "Band-pass"])
-        self.filter_mode_combo.currentTextChanged.connect(self._on_filter_changed)
-        filter_row.addWidget(self.filter_mode_combo)
-        self.filter_low_spin = QtWidgets.QDoubleSpinBox()
-        self.filter_low_spin.setRange(0.0, 0.5)
-        self.filter_low_spin.setDecimals(3)
-        self.filter_low_spin.setSingleStep(0.01)
-        self.filter_low_spin.setValue(0.01)
-        self.filter_low_spin.setSuffix(" xNyq")
-        self.filter_low_spin.valueChanged.connect(self._on_filter_changed)
-        filter_row.addWidget(QtWidgets.QLabel("Low cut"))
-        filter_row.addWidget(self.filter_low_spin)
-        self.filter_high_spin = QtWidgets.QDoubleSpinBox()
-        self.filter_high_spin.setRange(0.0, 0.5)
-        self.filter_high_spin.setDecimals(3)
-        self.filter_high_spin.setSingleStep(0.01)
-        self.filter_high_spin.setValue(0.25)
-        self.filter_high_spin.setSuffix(" xNyq")
-        self.filter_high_spin.valueChanged.connect(self._on_filter_changed)
-        filter_row.addWidget(QtWidgets.QLabel("High cut"))
-        filter_row.addWidget(self.filter_high_spin)
-        filter_row.addStretch(1)
-        layout.addLayout(filter_row)
-        self._sync_filter_controls()
-
         btn_row = QtWidgets.QHBoxLayout()
         # self.gauss_btn = QtWidgets.QPushButton("Gaussian Fit @ Cross")
         # self.gauss_btn.clicked.connect(self.compute_gaussian_fit)
@@ -831,6 +898,9 @@ class CameraApp(QtWidgets.QMainWindow):
         self.run_scipy_btn.clicked.connect(self.run_scipy_fit)
         self.run_scipy_btn.setEnabled(True)
         btn_row.addWidget(self.run_scipy_btn)
+        self.spot_fit_btn = QtWidgets.QPushButton("2D Spot Fit")
+        self.spot_fit_btn.clicked.connect(self.compute_2d_gaussian_fit)
+        btn_row.addWidget(self.spot_fit_btn)
         self.clear_fit_btn = QtWidgets.QPushButton("Clear Fits")
         self.clear_fit_btn.clicked.connect(self.clear_fits)
         btn_row.addWidget(self.clear_fit_btn)
@@ -863,6 +933,51 @@ class CameraApp(QtWidgets.QMainWindow):
         self.axis_plot_v.setMinimumHeight(140)
         self.axis_plot_v.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.axis_plot_v)
+
+        window.hide()
+        return window
+
+    def _build_filters_window(self) -> QtWidgets.QWidget:
+        window = QtWidgets.QWidget(None, QtCore.Qt.WindowType.Window)
+        window.setWindowTitle("Filters")
+        window.resize(420, 140)
+
+        layout = QtWidgets.QVBoxLayout(window)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        info_label = QtWidgets.QLabel("FFT filters apply to the image and line profiles.")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #ccc;")
+        layout.addWidget(info_label)
+
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.addWidget(QtWidgets.QLabel("Profile filter:"))
+        self.filter_mode_combo = QtWidgets.QComboBox()
+        self.filter_mode_combo.addItems(["None", "Low-pass", "High-pass", "Band-pass"])
+        self.filter_mode_combo.currentTextChanged.connect(self._on_filter_changed)
+        filter_row.addWidget(self.filter_mode_combo)
+        self.filter_low_spin = QtWidgets.QDoubleSpinBox()
+        self.filter_low_spin.setRange(0.0, 0.5)
+        self.filter_low_spin.setDecimals(3)
+        self.filter_low_spin.setSingleStep(0.01)
+        self.filter_low_spin.setValue(0.01)
+        self.filter_low_spin.setSuffix(" xNyq")
+        self.filter_low_spin.valueChanged.connect(self._on_filter_changed)
+        filter_row.addWidget(QtWidgets.QLabel("Low cut"))
+        filter_row.addWidget(self.filter_low_spin)
+        self.filter_high_spin = QtWidgets.QDoubleSpinBox()
+        self.filter_high_spin.setRange(0.0, 0.5)
+        self.filter_high_spin.setDecimals(3)
+        self.filter_high_spin.setSingleStep(0.01)
+        self.filter_high_spin.setValue(0.25)
+        self.filter_high_spin.setSuffix(" xNyq")
+        self.filter_high_spin.valueChanged.connect(self._on_filter_changed)
+        filter_row.addWidget(QtWidgets.QLabel("High cut"))
+        filter_row.addWidget(self.filter_high_spin)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+        self._sync_filter_controls()
 
         window.hide()
         return window
@@ -1018,7 +1133,7 @@ class CameraApp(QtWidgets.QMainWindow):
         row2 = QtWidgets.QHBoxLayout()
         for text, handler in [
             ("Clear Cross", self.clear_cross),
-            ("Fit", self.fit_to_window),
+            ("1:1", self.fit_to_window),
         ]:
             btn = QtWidgets.QPushButton(text)
             btn.clicked.connect(handler)
@@ -1029,6 +1144,9 @@ class CameraApp(QtWidgets.QMainWindow):
         self.fit_checkbox = QtWidgets.QCheckBox("Fit Window")
         self.fit_checkbox.stateChanged.connect(self.toggle_fit_window)
         row2.addWidget(self.fit_checkbox)
+        self.filters_checkbox = QtWidgets.QCheckBox("Filters")
+        self.filters_checkbox.stateChanged.connect(self.toggle_filters_window)
+        row2.addWidget(self.filters_checkbox)
         self.gray_checkbox = QtWidgets.QCheckBox("Grayscale")
         self.gray_checkbox.stateChanged.connect(self.toggle_grayscale)
         row2.addWidget(self.gray_checkbox)
@@ -1037,6 +1155,13 @@ class CameraApp(QtWidgets.QMainWindow):
         row2.addWidget(self.measure_checkbox)
         row2.addStretch(1)
 
+        
+        self.fft_clean_btn = QtWidgets.QPushButton("Clean FFT: OFF")
+        self.fft_clean_btn.setCheckable(True)
+        self.fft_clean_btn.clicked.connect(self._toggle_fft_cleaning)
+        layout.addWidget(self.fft_clean_btn)
+        
+        
         layout.addLayout(row1)
         layout.addLayout(row2)
         return layout
@@ -1590,7 +1715,15 @@ class CameraApp(QtWidgets.QMainWindow):
     #         self.camera.gamma = float(self.gamma_spin.value())
     #     except Exception as exc:
     #         QtWidgets.QMessageBox.critical(self, "Error", f"Failed to set gamma: {exc}")
-
+    
+    def _toggle_fft_cleaning(self):
+        """Updates the button state and forces a view refresh."""
+        enabled = self.fft_clean_btn.isChecked()
+        self.fft_clean_btn.setText(f"Clean FFT: {'ON' if enabled else 'OFF'}")
+        self.fft_clean_btn.setStyleSheet(f"background-color: {'#aaffaa' if enabled else '#f0f0f0'};")
+        if self.last_payload:
+            self._display_frame(self.last_payload)
+    
     def _update_mm_scale(self, value: float, axis: str):
         if axis == "x":
             self.mm_per_px_x = float(value)
@@ -1714,6 +1847,12 @@ class CameraApp(QtWidgets.QMainWindow):
         self.gain_value_label.setText(str(int(value)))
 
     def _display_frame(self, payload: FramePayload):
+        if getattr(self, "_fft_enabled", False):
+            from beam_profile_fitting import fft_clean_image
+            # Process the raw numpy data to remove fringes
+            payload.np_image = fft_clean_image(payload.np_image)
+            # Update the PIL image for display
+            payload.pil_image = Image.fromarray(payload.np_image.astype(np.uint8))
         self.last_payload = payload
         self._filtered_np_image_untransformed = self._apply_image_filter_np(payload.np_image)
         self._rebuild_view_transforms()
@@ -1823,6 +1962,30 @@ class CameraApp(QtWidgets.QMainWindow):
             self.fit_window.raise_()
         else:
             self.fit_window.hide()
+
+    def toggle_filters_window(self, state: int):
+        try:
+            checked = QtCore.Qt.CheckState(state) == QtCore.Qt.CheckState.Checked
+        except Exception:
+            checked = bool(state)
+        if not getattr(self, "filters_window", None):
+            return
+        if checked:
+            if not self._filters_window_positioned:
+                anchor_geom = None
+                if getattr(self, "controls_window", None):
+                    ctrl_geom = self.controls_window.frameGeometry()
+                    if ctrl_geom.isValid():
+                        anchor_geom = ctrl_geom
+                self._position_window_near_main(
+                    self.filters_window, QtCore.QPoint(18, 320 if anchor_geom else 160), anchor_geom=anchor_geom
+                )
+                self._filters_window_positioned = True
+            if not self.filters_window.isVisible():
+                self.filters_window.show()
+            self.filters_window.raise_()
+        else:
+            self.filters_window.hide()
 
     def toggle_measure_window(self, state: int):
         try:
@@ -4101,6 +4264,9 @@ class CameraApp(QtWidgets.QMainWindow):
         elif obj is getattr(self, "fit_window", None):
             if event.type() == QtCore.QEvent.Type.Move:
                 self._fit_window_positioned = True
+        elif obj is getattr(self, "filters_window", None):
+            if event.type() == QtCore.QEvent.Type.Move:
+                self._filters_window_positioned = True
         elif obj is getattr(self, "calibration_window", None):
             if event.type() == QtCore.QEvent.Type.Move:
                 self._calibration_window_positioned = True
@@ -4604,6 +4770,7 @@ class CameraApp(QtWidgets.QMainWindow):
             self._refresh_image_view()
             self.gauss_result_label.setText("Gauss X: -, Y: -")
             self._gauss_fit = None
+            self._gauss_fit_2d = None
 
     def clear_fits(self):
         """Clear line/axis fits, plots, overlays, and pending exports (keeps the cross)."""
@@ -4616,6 +4783,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self._axis_fit_results = {}
         self._axis_center_px = None
         self._gauss_fit = None
+        self._gauss_fit_2d = None
         self._pending_sections = {}
         if getattr(self, "line_plot_label", None):
             self.line_plot_label.clear()
@@ -4649,6 +4817,9 @@ class CameraApp(QtWidgets.QMainWindow):
             if getattr(self, "fit_window", None):
                 self._save_window_state(self.fit_window, "fit_window")
                 self.fit_window.close()
+            if getattr(self, "filters_window", None):
+                self._save_window_state(self.filters_window, "filters_window")
+                self.filters_window.close()
             if getattr(self, "calibration_window", None):
                 self._save_window_state(self.calibration_window, "calibration_window")
                 self.calibration_window.close()
