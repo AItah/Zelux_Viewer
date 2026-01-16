@@ -25,6 +25,7 @@ import csv
 from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -44,6 +45,8 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from thorlabs_tsi_sdk.tl_camera import Frame, TLCamera, TLCameraSDK
 from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
 from thorlabs_tsi_sdk.tl_mono_to_color_processor import MonoToColorProcessorSDK
+
+_CUDA_DLL_HANDLES: list[object] = []
 
 # Additional DLL path setup for repo-level dlls/{64,32}_lib
 def _add_repo_dll_path():
@@ -75,6 +78,69 @@ def _add_bundle_dll_path():
 
 _add_repo_dll_path()
 _add_bundle_dll_path()
+
+
+def _add_cuda_dll_paths():
+    if sys.platform != "win32":
+        return
+    try:
+        venv_root = Path(sys.executable).resolve().parent.parent
+        site_packages = venv_root / "Lib" / "site-packages"
+        candidates = [
+            site_packages / "cupy_backends" / "cuda" / "libs",
+            site_packages / "nvidia" / "cufft" / "bin",
+            site_packages / "nvidia" / "cuda_runtime" / "bin",
+            site_packages / "nvidia" / "curand" / "bin",
+            site_packages / "nvidia" / "cuda_nvrtc" / "bin",
+            site_packages / "nvidia" / "nvrtc" / "bin",
+            site_packages / "nvidia" / "cublas" / "bin",
+            Path(sys.prefix) / "Library" / "bin",
+        ]
+        path_entries = os.environ.get("PATH", "")
+        path_list = [p for p in path_entries.split(os.pathsep) if p]
+        path_set = {p.lower() for p in path_list}
+        new_paths = []
+        for path in candidates:
+            if path.is_dir():
+                path_str = str(path)
+                handle = os.add_dll_directory(path_str)
+                _CUDA_DLL_HANDLES.append(handle)
+                if path_str.lower() not in path_set:
+                    new_paths.append(path_str)
+                    path_set.add(path_str.lower())
+        if new_paths:
+            os.environ["PATH"] = os.pathsep.join(new_paths + path_list)
+    except Exception:
+        pass
+
+
+_add_cuda_dll_paths()
+
+try:
+    from scipy import fft as scipy_fft
+
+    _HAVE_SCIPY_FFT = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAVE_SCIPY_FFT = False
+    scipy_fft = None  # type: ignore[assignment]
+try:
+    from scipy.optimize import least_squares as scipy_least_squares
+
+    _HAVE_SCIPY_OPT = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAVE_SCIPY_OPT = False
+    scipy_least_squares = None  # type: ignore[assignment]
+
+try:
+    import cupy as cp  # Optional GPU acceleration
+
+    _HAVE_CUPY = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAVE_CUPY = False
+    cp = None  # type: ignore[assignment]
+
+_GPU_FFT_AVAILABLE = _HAVE_CUPY
+_GPU_FFT_ERROR: Optional[str] = None
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -698,6 +764,20 @@ class CameraApp(QtWidgets.QMainWindow):
         if self.last_payload is None:
             return
 
+        def _downsample_by2_mean(arr: np.ndarray) -> np.ndarray:
+            h, w = arr.shape
+            h2 = h // 2
+            w2 = w // 2
+            if h2 < 1 or w2 < 1:
+                return arr
+            cropped = arr[: h2 * 2, : w2 * 2]
+            return 0.25 * (
+                cropped[0::2, 0::2]
+                + cropped[1::2, 0::2]
+                + cropped[0::2, 1::2]
+                + cropped[1::2, 1::2]
+            )
+
         data = self._display_np_image if self._display_np_image is not None else (
             self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
         )
@@ -710,6 +790,9 @@ class CameraApp(QtWidgets.QMainWindow):
             use_roi = self._roi_rect is not None
             roi_offset = (0, 0)
             fit_data = data
+            downsample = False
+            ds_scale = 1.0
+            ds_offset = 0.0
             if use_roi:
                 x0r, y0r, x1r, y1r = self._roi_rect
                 if x1r - x0r < 5 or y1r - y0r < 5:
@@ -722,6 +805,14 @@ class CameraApp(QtWidgets.QMainWindow):
                 method = "moments"
             elif mode_text == "Accurate (full LS)":
                 method = "moments_ls"
+            elif mode_text == "Accurate (LS, downsample x2 + center 1D)":
+                method = "moments_ls"
+                downsample = True
+                use_roi = False
+                roi_offset = (0, 0)
+                fit_data = _downsample_by2_mean(data)
+                ds_scale = 2.0
+                ds_offset = 0.5
             else:
                 method = "fast_ls"
 
@@ -739,6 +830,11 @@ class CameraApp(QtWidgets.QMainWindow):
             return
 
         I0, x0, y0, wx, wy, theta, c, ax, ay = params
+        if downsample:
+            x0 = x0 * ds_scale + ds_offset
+            y0 = y0 * ds_scale + ds_offset
+            wx = wx * ds_scale
+            wy = wy * ds_scale
         if roi_offset != (0, 0):
             x0 += roi_offset[0]
             y0 += roi_offset[1]
@@ -786,9 +882,16 @@ class CameraApp(QtWidgets.QMainWindow):
         )
         if getattr(self, "gauss_result_label", None):
             self.gauss_result_label.setText(
-                f"2D spot fit: center ({x0:.2f}px, {y0:.2f}px), 1/e^2 diam {2*wx:.2f}px ({2*w_major_mm:.3f}mm) x "
-                f"{2*wy:.2f}px ({2*w_minor_mm:.3f}mm), angle {angle_deg:.1f} deg"
+                f"2D spot fit: center ({x0:.2f}px, {y0:.2f}px), "
+                f"1/e^2 radii wx={wx:.2f}px ({w_major_mm:.3f}mm), wy={wy:.2f}px ({w_minor_mm:.3f}mm), "
+                f"1/e^2 diam {2*wx:.2f}px ({2*w_major_mm:.3f}mm) x {2*wy:.2f}px ({2*w_minor_mm:.3f}mm), "
+                f"angle {angle_deg:.1f} deg"
             )
+        if mode_text == "Accurate (LS, downsample x2 + center 1D)":
+            self._run_centered_axis_fit(float(x0), float(y0))
+            if getattr(self, "line_plot_label", None):
+                self.line_plot_label.clear()
+                self.line_plot_label.setVisible(False)
         self._refresh_image_view()
     
     def _build_ui(self):
@@ -989,7 +1092,14 @@ class CameraApp(QtWidgets.QMainWindow):
         mode_row = QtWidgets.QHBoxLayout()
         mode_row.addWidget(QtWidgets.QLabel("2D fit mode:"))
         self.fit2d_mode_combo = QtWidgets.QComboBox()
-        self.fit2d_mode_combo.addItems(["Fast (LS, optional ROI)", "Accurate (full LS)", "Moments (fast)"])
+        self.fit2d_mode_combo.addItems(
+            [
+                "Fast (LS, optional ROI)",
+                "Accurate (full LS)",
+                "Accurate (LS, downsample x2 + center 1D)",
+                "Moments (fast)",
+            ]
+        )
         self.fit2d_mode_combo.currentIndexChanged.connect(self._save_fit_settings)
         mode_row.addWidget(self.fit2d_mode_combo)
         mode_row.addStretch(1)
@@ -1301,6 +1411,8 @@ class CameraApp(QtWidgets.QMainWindow):
             mode = "Fast (LS, optional ROI)"
         elif mode in ("Accurate (moments+LS)", "Accurate (full LS)"):
             mode = "Accurate (full LS)"
+        elif mode in ("Accurate (LS, downsample x2 + center 1D)",):
+            mode = "Accurate (LS, downsample x2 + center 1D)"
         elif mode in ("Moments (fast)",):
             mode = "Moments (fast)"
         if getattr(self, "fit2d_mode_combo", None):
@@ -3112,6 +3224,8 @@ class CameraApp(QtWidgets.QMainWindow):
         waist_mm: float,
         raw_profile: Optional[np.ndarray] = None,
     ):
+        if getattr(self, "line_plot_label", None):
+            self.line_plot_label.setVisible(True)
         width = 540
         height = 240
         margin = 36
@@ -3840,6 +3954,78 @@ class CameraApp(QtWidgets.QMainWindow):
         gamma0 = max(fwhm_est / 2.0, 0.3)
 
         x = np.arange(prof.size, dtype=np.float64)
+        if _HAVE_SCIPY_OPT:
+            min_y = float(np.min(prof))
+            max_y = float(np.max(prof))
+            amp_span = max(max_y - min_y, 1e-9)
+            amp_hi = max(amp_span * 2.0, amp0 * 5.0, 1e-6)
+            base_lo = min_y - amp_hi
+            base_hi = max_y + amp_hi
+            noise = float(np.std(prof - smooth)) if smooth is not None else float(np.std(prof))
+            if not np.isfinite(noise) or noise <= 0:
+                noise = float(np.std(prof))
+            f_scale = max(noise, 1e-6)
+            width_hi = max(2.0, float(prof.size))
+
+            def _fit_model(model: str) -> Optional[dict]:
+                if model == "gauss":
+                    def model_fn(p):
+                        b, A, mu, s = p
+                        s = max(s, 1e-6)
+                        return b + A * np.exp(-0.5 * ((x - mu) / s) ** 2)
+                    p0 = np.array([baseline, amp0, mu0, sigma0], dtype=np.float64)
+                    lb = np.array([base_lo, 0.0, 0.0, 0.2], dtype=np.float64)
+                    ub = np.array([base_hi, amp_hi, prof.size - 1.0, width_hi], dtype=np.float64)
+                elif model == "lorentz":
+                    def model_fn(p):
+                        b, A, mu, g = p
+                        g = max(g, 1e-6)
+                        return b + A * (g * g) / ((x - mu) ** 2 + g * g)
+                    p0 = np.array([baseline, amp0, mu0, gamma0], dtype=np.float64)
+                    lb = np.array([base_lo, 0.0, 0.0, 0.2], dtype=np.float64)
+                    ub = np.array([base_hi, amp_hi, prof.size - 1.0, width_hi], dtype=np.float64)
+                else:
+                    return None
+
+                def residuals(p):
+                    return model_fn(p) - prof
+
+                try:
+                    res = scipy_least_squares(
+                        residuals,
+                        p0,
+                        bounds=(lb, ub),
+                        loss="soft_l1",
+                        f_scale=f_scale,
+                        max_nfev=400,
+                    )
+                except Exception:
+                    return None
+                p = res.x
+                curve = model_fn(p)
+                err = float(np.mean((prof - curve) ** 2))
+                return {
+                    "model": model,
+                    "baseline": float(p[0]),
+                    "amplitude": float(p[1]),
+                    "mu": float(p[2]),
+                    "width": float(p[3]),
+                    "fit_curve": curve,
+                    "sse": err,
+                }
+
+            best = None
+            for model in models:
+                result = _fit_model(model)
+                if result is None:
+                    continue
+                if best is None or result["sse"] < best["sse"]:
+                    best = result
+            if best is not None:
+                var = float(np.var(prof))
+                best["r2"] = max(0.0, 1.0 - best["sse"] / var) if var > 0 else 0.0
+                return best
+
         mu_candidates = np.clip(mu0 + np.linspace(-2.0, 2.0, 5), 0.0, prof.size - 1.0)
         best = None
 
@@ -3895,23 +4081,70 @@ class CameraApp(QtWidgets.QMainWindow):
         n = data.size
         if mode_text == "None" or n < 2:
             return data
-        freqs = np.fft.rfftfreq(n, d=1.0)
-        spectrum = np.fft.rfft(data)
-        if mode_text == "Low-pass":
-            mask = freqs <= high_cut
-        elif mode_text == "High-pass":
-            mask = freqs >= low_cut
-        elif mode_text == "Band-pass":
-            if low_cut >= high_cut:
+        global _GPU_FFT_AVAILABLE, _GPU_FFT_ERROR
+
+        def _cpu_filter(arr: np.ndarray) -> np.ndarray:
+            if _HAVE_SCIPY_FFT:
+                freqs = scipy_fft.rfftfreq(n, d=1.0)
+                spectrum = scipy_fft.rfft(arr, workers=-1)
+                if mode_text == "Low-pass":
+                    mask = freqs <= high_cut
+                elif mode_text == "High-pass":
+                    mask = freqs >= low_cut
+                elif mode_text == "Band-pass":
+                    if low_cut >= high_cut:
+                        mask = freqs >= low_cut
+                    else:
+                        mask = (freqs >= low_cut) & (freqs <= high_cut)
+                else:
+                    return arr
+                if not np.any(mask):
+                    return arr
+                filtered = scipy_fft.irfft(spectrum * mask, n=n, workers=-1)
+                return np.asarray(filtered, dtype=np.float64)
+            freqs = np.fft.rfftfreq(n, d=1.0)
+            spectrum = np.fft.rfft(arr)
+            if mode_text == "Low-pass":
+                mask = freqs <= high_cut
+            elif mode_text == "High-pass":
                 mask = freqs >= low_cut
+            elif mode_text == "Band-pass":
+                if low_cut >= high_cut:
+                    mask = freqs >= low_cut
+                else:
+                    mask = (freqs >= low_cut) & (freqs <= high_cut)
             else:
-                mask = (freqs >= low_cut) & (freqs <= high_cut)
-        else:
-            return data
-        if not np.any(mask):
-            return data
-        filtered = np.fft.irfft(spectrum * mask, n=n)
-        return np.asarray(filtered, dtype=np.float64)
+                return arr
+            if not np.any(mask):
+                return arr
+            filtered = np.fft.irfft(spectrum * mask, n=n)
+            return np.asarray(filtered, dtype=np.float64)
+
+        if _GPU_FFT_AVAILABLE and _HAVE_CUPY:
+            try:
+                data_gpu = cp.asarray(data, dtype=cp.float32)
+                freqs = cp.fft.rfftfreq(n, d=1.0)
+                spectrum = cp.fft.rfft(data_gpu)
+                if mode_text == "Low-pass":
+                    mask = freqs <= high_cut
+                elif mode_text == "High-pass":
+                    mask = freqs >= low_cut
+                elif mode_text == "Band-pass":
+                    if low_cut >= high_cut:
+                        mask = freqs >= low_cut
+                    else:
+                        mask = (freqs >= low_cut) & (freqs <= high_cut)
+                else:
+                    return data
+                if bool(cp.any(mask)) is False:
+                    return data
+                filtered = cp.fft.irfft(spectrum * mask, n=n)
+                return np.asarray(cp.asnumpy(filtered), dtype=np.float64)
+            except Exception as exc:
+                _GPU_FFT_AVAILABLE = False
+                _GPU_FFT_ERROR = f"{type(exc).__name__}: {exc}"
+
+        return _cpu_filter(data)
 
     def _apply_image_filter_np(self, data: np.ndarray) -> Optional[np.ndarray]:
         """Apply selected FFT filter (low/high/band) to the full image (per channel)."""
@@ -3936,6 +4169,56 @@ class CameraApp(QtWidgets.QMainWindow):
             h, w = chan.shape
             if h < 2 or w < 2:
                 return chan
+            global _GPU_FFT_AVAILABLE, _GPU_FFT_ERROR
+            if _GPU_FFT_AVAILABLE and _HAVE_CUPY:
+                try:
+                    chan_gpu = cp.asarray(chan, dtype=cp.float32)
+                    fy = cp.fft.fftfreq(h, d=1.0)
+                    fx = cp.fft.fftfreq(w, d=1.0)
+                    fx_grid, fy_grid = cp.meshgrid(fx, fy)
+                    radius = cp.sqrt(fx_grid * fx_grid + fy_grid * fy_grid)
+                    if mode_text == "Low-pass":
+                        mask = radius <= high_cut
+                    elif mode_text == "High-pass":
+                        mask = radius >= low_cut
+                    elif mode_text == "Band-pass":
+                        if low_cut >= high_cut:
+                            mask = radius >= low_cut
+                        else:
+                            mask = (radius >= low_cut) & (radius <= high_cut)
+                    else:
+                        return chan
+                    if bool(cp.any(mask)) is False:
+                        return chan
+                    spec = cp.fft.fft2(chan_gpu)
+                    filtered = cp.fft.ifft2(spec * mask).real
+                    return cp.asnumpy(filtered)
+                except Exception as exc:
+                    _GPU_FFT_AVAILABLE = False
+                    _GPU_FFT_ERROR = f"{type(exc).__name__}: {exc}"
+
+            if _HAVE_SCIPY_FFT:
+                fy = scipy_fft.fftfreq(h, d=1.0)
+                fx = scipy_fft.fftfreq(w, d=1.0)
+                fx_grid, fy_grid = np.meshgrid(fx, fy)
+                radius = np.sqrt(fx_grid * fx_grid + fy_grid * fy_grid)
+                if mode_text == "Low-pass":
+                    mask = radius <= high_cut
+                elif mode_text == "High-pass":
+                    mask = radius >= low_cut
+                elif mode_text == "Band-pass":
+                    if low_cut >= high_cut:
+                        mask = radius >= low_cut
+                    else:
+                        mask = (radius >= low_cut) & (radius <= high_cut)
+                else:
+                    return chan
+                if not np.any(mask):
+                    return chan
+                spec = scipy_fft.fft2(chan, workers=-1)
+                filtered = scipy_fft.ifft2(spec * mask, workers=-1).real
+                return filtered
+
             fy = np.fft.fftfreq(h, d=1.0)
             fx = np.fft.fftfreq(w, d=1.0)
             fx_grid, fy_grid = np.meshgrid(fx, fy)
@@ -4539,10 +4822,10 @@ class CameraApp(QtWidgets.QMainWindow):
             return
         mu_x_mm, mu_y_mm, sigma_major_mm, sigma_minor_mm, _ = stats_mm
 
-        w1e2_major = np.sqrt(2.0) * sigma_major
-        w1e2_minor = np.sqrt(2.0) * sigma_minor
-        w1e2_major_mm = np.sqrt(2.0) * sigma_major_mm
-        w1e2_minor_mm = np.sqrt(2.0) * sigma_minor_mm
+        w1e2_major = 2.0 * sigma_major
+        w1e2_minor = 2.0 * sigma_minor
+        w1e2_major_mm = 2.0 * sigma_major_mm
+        w1e2_minor_mm = 2.0 * sigma_minor_mm
 
         peak = baseline + float(weights.max())
         waist_ratio = (w1e2_major_mm / w1e2_minor_mm) if w1e2_minor_mm else 0.0
@@ -4610,8 +4893,8 @@ class CameraApp(QtWidgets.QMainWindow):
             gamma_mm = width * mm_step
             fwhm_px = 2.0 * gamma_px
             fwhm_mm = 2.0 * gamma_mm
-            w1e2_px = 2.0 * gamma_px * np.sqrt(np.e**2 - 1.0)
-            w1e2_mm = 2.0 * gamma_mm * np.sqrt(np.e**2 - 1.0)
+            w1e2_px = gamma_px * np.sqrt(np.e**2 - 1.0)
+            w1e2_mm = gamma_mm * np.sqrt(np.e**2 - 1.0)
             width_label = "gamma"
             width_px_val = gamma_px
             width_mm_val = gamma_mm
@@ -4620,8 +4903,8 @@ class CameraApp(QtWidgets.QMainWindow):
             sigma_mm = width * mm_step
             fwhm_px = 2.3548 * sigma_px
             fwhm_mm = 2.3548 * sigma_mm
-            w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
-            w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
+            w1e2_px = 2.0 * sigma_px
+            w1e2_mm = 2.0 * sigma_mm
             width_label = "sigma"
             width_px_val = sigma_px
             width_mm_val = sigma_mm
@@ -4682,8 +4965,8 @@ class CameraApp(QtWidgets.QMainWindow):
             gamma_mm = width * mm_step
             fwhm_px = 2.0 * gamma_px
             fwhm_mm = 2.0 * gamma_mm
-            w1e2_px = 2.0 * gamma_px * np.sqrt(np.e**2 - 1.0)
-            w1e2_mm = 2.0 * gamma_mm * np.sqrt(np.e**2 - 1.0)
+            w1e2_px = gamma_px * np.sqrt(np.e**2 - 1.0)
+            w1e2_mm = gamma_mm * np.sqrt(np.e**2 - 1.0)
             width_px_val = gamma_px
             width_mm_val = gamma_mm
         else:
@@ -4691,8 +4974,8 @@ class CameraApp(QtWidgets.QMainWindow):
             sigma_mm = width * mm_step
             fwhm_px = 2.3548 * sigma_px
             fwhm_mm = 2.3548 * sigma_mm
-            w1e2_px = 2.0 * np.sqrt(2.0) * sigma_px
-            w1e2_mm = 2.0 * np.sqrt(2.0) * sigma_mm
+            w1e2_px = 2.0 * sigma_px
+            w1e2_mm = 2.0 * sigma_mm
             width_px_val = sigma_px
             width_mm_val = sigma_mm
         mu_pos_px = (mu / max(len(px_axis) - 1, 1)) * length_px
@@ -4715,6 +4998,67 @@ class CameraApp(QtWidgets.QMainWindow):
             "mu_px": mu_pos_px,
             "mu_mm": mu_pos_mm,
         }
+
+    def _run_centered_axis_fit(self, cx: float, cy: float) -> None:
+        if not self.last_payload:
+            self.axis_fit_status.setText("Axis fit: no image.")
+            return
+        data = self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
+        if data.ndim == 3:
+            data = np.mean(data, axis=2)
+        h, w = data.shape
+        cx = float(np.clip(cx, 0, w - 1))
+        cy = float(np.clip(cy, 0, h - 1))
+
+        horiz_p1 = (0, int(round(cy)))
+        horiz_p2 = (w - 1, int(round(cy)))
+        vert_p1 = (int(round(cx)), 0)
+        vert_p2 = (int(round(cx)), h - 1)
+
+        fit_h = self._compute_axis_line_fit("Horizontal", horiz_p1, horiz_p2)
+        fit_v = self._compute_axis_line_fit("Vertical", vert_p1, vert_p2)
+        if not fit_h or not fit_v:
+            self.axis_fit_status.setText("Axis fit failed: could not fit axes.")
+            return
+
+        self._axis_lines = [
+            (horiz_p1, horiz_p2, QtGui.QColor(0, 200, 255)),
+            (vert_p1, vert_p2, QtGui.QColor(255, 120, 0)),
+        ]
+        self._axis_fit_results = {"H": fit_h, "V": fit_v}
+        self._axis_center_px = (cx, cy)
+        self.cross_pos = (int(round(cx)), int(round(cy)))
+
+        self._update_axis_plot(
+            self.axis_plot_h,
+            "Horizontal profile (cyan) + fit (orange)",
+            fit_h["px_axis"],
+            fit_h["profile"],
+            fit_h["fit_curve"],
+            fit_h["length_mm"],
+            fit_h["fwhm_mm"],
+            fit_h["w1e2_mm"],
+        )
+        self._update_axis_plot(
+            self.axis_plot_v,
+            "Vertical profile (cyan) + fit (orange)",
+            fit_v["px_axis"],
+            fit_v["profile"],
+            fit_v["fit_curve"],
+            fit_v["length_mm"],
+            fit_v["fwhm_mm"],
+            fit_v["w1e2_mm"],
+        )
+
+        self.axis_fit_status.setText(
+            "Centered axis fit OK: "
+            f"H FWHM={fit_h['fwhm_px']:.2f}px ({fit_h['fwhm_mm']:.3f}mm); "
+            f"V FWHM={fit_v['fwhm_px']:.2f}px ({fit_v['fwhm_mm']:.3f}mm)"
+        )
+        self._pending_sections["horizontal"] = (fit_h["px_axis"], fit_h["raw_profile"])
+        self._pending_sections["vertical"] = (fit_v["px_axis"], fit_v["raw_profile"])
+        self._line_edit_mode = False
+        self._sync_panning_enabled()
 
     def run_360_fit(self):
         if not self.last_payload:
