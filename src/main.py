@@ -740,6 +740,10 @@ class CameraApp(QtWidgets.QMainWindow):
         self._axis_lines: list[tuple[tuple[int, int], tuple[int, int], QtGui.QColor]] = []
         self._axis_fit_results = {}
         self._axis_center_px: Optional[tuple[float, float]] = None
+        self._fit_plot_unit = "mm"
+        self._fit_plot_zoom = 1.0
+        self._fit_plot_cache_line: Optional[dict] = None
+        self._fit_plot_cache_axis: dict[str, Optional[dict]] = {"H": None, "V": None}
         self._settings = QtCore.QSettings("BaslerTool", "Viewer")
         self._filtered_np_image: Optional[np.ndarray] = None
         self._pending_sections: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -892,6 +896,7 @@ class CameraApp(QtWidgets.QMainWindow):
             if getattr(self, "line_plot_label", None):
                 self.line_plot_label.clear()
                 self.line_plot_label.setVisible(False)
+                self._fit_plot_cache_line = None
         self._refresh_image_view()
     
     def _build_ui(self):
@@ -1144,6 +1149,23 @@ class CameraApp(QtWidgets.QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("X unit:"))
+        self.fit_plot_unit_combo = QtWidgets.QComboBox()
+        self.fit_plot_unit_combo.addItems(["mm", "px"])
+        self.fit_plot_unit_combo.currentTextChanged.connect(self._on_fit_plot_settings_changed)
+        controls.addWidget(self.fit_plot_unit_combo)
+        controls.addWidget(QtWidgets.QLabel("Zoom:"))
+        self.fit_plot_zoom_spin = QtWidgets.QDoubleSpinBox()
+        self.fit_plot_zoom_spin.setRange(1.0, 8.0)
+        self.fit_plot_zoom_spin.setDecimals(2)
+        self.fit_plot_zoom_spin.setSingleStep(0.1)
+        self.fit_plot_zoom_spin.setValue(1.0)
+        self.fit_plot_zoom_spin.valueChanged.connect(self._on_fit_plot_settings_changed)
+        controls.addWidget(self.fit_plot_zoom_spin)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
         self.line_plot_label = QtWidgets.QLabel(window)
         self.line_plot_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.line_plot_label.setStyleSheet("background-color: #111;")
@@ -1170,6 +1192,7 @@ class CameraApp(QtWidgets.QMainWindow):
         grip_row.addWidget(QtWidgets.QSizeGrip(window))
         layout.addLayout(grip_row)
 
+        self._load_fit_plot_settings()
         window.hide()
         return window
 
@@ -1427,6 +1450,71 @@ class CameraApp(QtWidgets.QMainWindow):
             return
         if getattr(self, "fit2d_mode_combo", None):
             self._settings.setValue("fit/2d_mode", self.fit2d_mode_combo.currentText())
+
+    def _load_fit_plot_settings(self):
+        if not getattr(self, "_settings", None):
+            return
+        unit = self._settings.value("fit_plots/unit", "mm", type=str)
+        zoom = self._settings.value("fit_plots/zoom", 1.0, type=float)
+        if unit not in ("mm", "px"):
+            unit = "mm"
+        zoom = float(np.clip(zoom, 1.0, 8.0))
+        self._fit_plot_unit = unit
+        self._fit_plot_zoom = zoom
+        if getattr(self, "fit_plot_unit_combo", None):
+            idx = self.fit_plot_unit_combo.findText(unit)
+            if idx >= 0:
+                self.fit_plot_unit_combo.blockSignals(True)
+                self.fit_plot_unit_combo.setCurrentIndex(idx)
+                self.fit_plot_unit_combo.blockSignals(False)
+        if getattr(self, "fit_plot_zoom_spin", None):
+            self.fit_plot_zoom_spin.blockSignals(True)
+            self.fit_plot_zoom_spin.setValue(zoom)
+            self.fit_plot_zoom_spin.blockSignals(False)
+
+    def _save_fit_plot_settings(self):
+        if not getattr(self, "_settings", None):
+            return
+        if getattr(self, "fit_plot_unit_combo", None):
+            self._settings.setValue("fit_plots/unit", self.fit_plot_unit_combo.currentText())
+        if getattr(self, "fit_plot_zoom_spin", None):
+            self._settings.setValue("fit_plots/zoom", float(self.fit_plot_zoom_spin.value()))
+
+    def _on_fit_plot_settings_changed(self):
+        if getattr(self, "fit_plot_unit_combo", None):
+            self._fit_plot_unit = self.fit_plot_unit_combo.currentText()
+        if getattr(self, "fit_plot_zoom_spin", None):
+            self._fit_plot_zoom = float(self.fit_plot_zoom_spin.value())
+        self._save_fit_plot_settings()
+        self._render_fit_plots_from_cache()
+
+    def _render_fit_plots_from_cache(self):
+        cache = self._fit_plot_cache_line
+        if cache:
+            self._update_line_plot(
+                cache["x_axis"],
+                cache["profile"],
+                cache["fit_curve"],
+                cache["length_mm"],
+                cache["fwhm_mm"],
+                cache["waist_mm"],
+                raw_profile=cache.get("raw_profile"),
+            )
+        for key in ("H", "V"):
+            axis_cache = self._fit_plot_cache_axis.get(key)
+            if not axis_cache:
+                continue
+            target = self.axis_plot_h if key == "H" else self.axis_plot_v
+            self._update_axis_plot(
+                target,
+                axis_cache["title"],
+                axis_cache["x_axis"],
+                axis_cache["profile"],
+                axis_cache["fit_curve"],
+                axis_cache["length_mm"],
+                axis_cache["fwhm_mm"],
+                axis_cache["waist_mm"],
+            )
 
     def _update_fit_roi_label(self):
         label = getattr(self, "fit_roi_label", None)
@@ -3226,21 +3314,56 @@ class CameraApp(QtWidgets.QMainWindow):
     ):
         if getattr(self, "line_plot_label", None):
             self.line_plot_label.setVisible(True)
+        self._fit_plot_cache_line = {
+            "x_axis": x_axis,
+            "profile": profile,
+            "fit_curve": fit_curve,
+            "length_mm": length_mm,
+            "fwhm_mm": fwhm_mm,
+            "waist_mm": waist_mm,
+            "raw_profile": raw_profile,
+        }
         width = 540
         height = 240
         margin = 36
         if x_axis.size == 0:
             self.line_plot_label.clear()
             return
-        y_values = [profile, fit_curve]
-        if raw_profile is not None:
-            y_values.append(raw_profile)
+        unit = getattr(self, "_fit_plot_unit", "mm")
+        if unit == "mm" and length_mm > 0:
+            scale = length_mm / max(float(x_axis[-1]), 1e-9)
+            x_display = x_axis * scale
+            unit_label = "mm"
+        else:
+            x_display = x_axis
+            unit_label = "px"
+        zoom = float(getattr(self, "_fit_plot_zoom", 1.0))
+        x_min_full = float(x_display[0])
+        x_max_full = float(x_display[-1])
+        span_full = max(x_max_full - x_min_full, 1e-9)
+        span_zoom = span_full / max(zoom, 1.0)
+        center = 0.5 * (x_min_full + x_max_full)
+        x_min = max(x_min_full, center - 0.5 * span_zoom)
+        x_max = min(x_max_full, center + 0.5 * span_zoom)
+        mask = (x_display >= x_min) & (x_display <= x_max)
+        if np.count_nonzero(mask) < 2:
+            mask = np.ones_like(x_display, dtype=bool)
+            x_min = x_min_full
+            x_max = x_max_full
+        x_plot = x_display[mask]
+        profile_plot = profile[mask]
+        fit_plot = fit_curve[mask]
+        raw_plot = raw_profile[mask] if raw_profile is not None else None
+
+        y_values = [profile_plot, fit_plot]
+        if raw_plot is not None:
+            y_values.append(raw_plot)
         y_min = float(min(np.min(arr) for arr in y_values))
         y_max = float(max(np.max(arr) for arr in y_values))
         if y_max - y_min < 1e-6:
             y_max = y_min + 1.0
         def scale_x(x):
-            return margin + (x - x_axis[0]) / max(1e-9, x_axis[-1] - x_axis[0]) * (width - 2 * margin)
+            return margin + (x - x_min) / max(1e-9, x_max - x_min) * (width - 2 * margin)
         def scale_y(y):
             return height - margin - (y - y_min) / (y_max - y_min) * (height - 2 * margin)
 
@@ -3252,47 +3375,72 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.drawRect(margin, margin, width - 2 * margin, height - 2 * margin)
 
         # Optional raw profile
-        if raw_profile is not None:
+        if raw_plot is not None:
             painter.setPen(QtGui.QPen(QtGui.QColor(140, 140, 140), 1, QtCore.Qt.PenStyle.DashLine))
-            for i in range(1, len(x_axis)):
+            for i in range(1, len(x_plot)):
                 painter.drawLine(
-                    QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(raw_profile[i - 1])),
-                    QtCore.QPointF(scale_x(x_axis[i]), scale_y(raw_profile[i])),
+                    QtCore.QPointF(scale_x(x_plot[i - 1]), scale_y(raw_plot[i - 1])),
+                    QtCore.QPointF(scale_x(x_plot[i]), scale_y(raw_plot[i])),
                 )
 
         # Filtered profile line
         painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255), 2))
-        for i in range(1, len(x_axis)):
+        for i in range(1, len(x_plot)):
             painter.drawLine(
-                QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(profile[i - 1])),
-                QtCore.QPointF(scale_x(x_axis[i]), scale_y(profile[i])),
+                QtCore.QPointF(scale_x(x_plot[i - 1]), scale_y(profile_plot[i - 1])),
+                QtCore.QPointF(scale_x(x_plot[i]), scale_y(profile_plot[i])),
             )
 
         # Fit line
         painter.setPen(QtGui.QPen(QtGui.QColor(255, 150, 0), 2))
-        for i in range(1, len(x_axis)):
+        for i in range(1, len(x_plot)):
             painter.drawLine(
-                QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(fit_curve[i - 1])),
-                QtCore.QPointF(scale_x(x_axis[i]), scale_y(fit_curve[i])),
+                QtCore.QPointF(scale_x(x_plot[i - 1]), scale_y(fit_plot[i - 1])),
+                QtCore.QPointF(scale_x(x_plot[i]), scale_y(fit_plot[i])),
             )
 
         painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
-        waist_diam_mm = waist_mm * 2.0
+        x_axis_span_px = float(max(x_axis[-1], 1e-9))
+        if unit_label == "mm":
+            waist_val = waist_mm
+            fwhm_val = fwhm_mm
+        else:
+            if length_mm > 0:
+                px_per_mm = x_axis_span_px / length_mm
+                waist_val = waist_mm * px_per_mm
+                fwhm_val = fwhm_mm * px_per_mm
+            else:
+                waist_val = waist_mm
+                fwhm_val = fwhm_mm
+        waist_diam_val = waist_val * 2.0
         painter.drawText(
             margin,
             margin - 6,
-            f"Line profile (cyan) & fit (orange) | 2*w={waist_diam_mm:.3f}mm, FWHM={fwhm_mm:.3f}mm",
+            f"Line profile (cyan) & fit (orange) | 2*w={waist_diam_val:.3f}{unit_label}, FWHM={fwhm_val:.3f}{unit_label}",
         )
-        painter.drawText(
-            width // 2 - 60,
-            height - 6,
-            f"Distance: 0-{x_axis[-1]:.1f}px ({max(length_mm,0):.3f}mm)",
-        )
+        span = max(x_max - x_min, 1e-9)
+        if unit_label == "mm":
+            tick_fmt = "{:.3f}" if span < 1.0 else "{:.2f}"
+        else:
+            tick_fmt = "{:.1f}" if span < 20 else "{:.0f}"
+        ticks = np.linspace(x_min, x_max, 5)
+        for tick in ticks:
+            x_pos = scale_x(float(tick))
+            painter.drawLine(QtCore.QPointF(x_pos, height - margin), QtCore.QPointF(x_pos, height - margin + 4))
+            painter.drawText(QtCore.QPointF(x_pos - 12.0, height - 6.0), tick_fmt.format(tick))
+
+        yticks = np.linspace(y_min, y_max, 3)
+        for tick in yticks:
+            y_pos = scale_y(float(tick))
+            painter.drawLine(QtCore.QPointF(margin - 4, y_pos), QtCore.QPointF(margin, y_pos))
+            painter.drawText(QtCore.QPointF(4.0, y_pos + 4.0), f"{tick:.1f}")
+
         painter.save()
         painter.translate(12, height // 2 + 40)
         painter.rotate(-90)
         painter.drawText(0, 0, "Intensity (gray level)")
         painter.restore()
+        painter.drawText(QtCore.QPointF(width / 2 - 40.0, height - 18.0), f"Distance ({unit_label})")
         painter.end()
         self.line_plot_label.setPixmap(QtGui.QPixmap.fromImage(img))
 
@@ -3307,18 +3455,63 @@ class CameraApp(QtWidgets.QMainWindow):
         fwhm_mm: float,
         waist_mm: float,
     ):
+        if target is getattr(self, "axis_plot_h", None):
+            self._fit_plot_cache_axis["H"] = {
+                "title": title,
+                "x_axis": x_axis,
+                "profile": profile,
+                "fit_curve": fit_curve,
+                "length_mm": length_mm,
+                "fwhm_mm": fwhm_mm,
+                "waist_mm": waist_mm,
+            }
+        elif target is getattr(self, "axis_plot_v", None):
+            self._fit_plot_cache_axis["V"] = {
+                "title": title,
+                "x_axis": x_axis,
+                "profile": profile,
+                "fit_curve": fit_curve,
+                "length_mm": length_mm,
+                "fwhm_mm": fwhm_mm,
+                "waist_mm": waist_mm,
+            }
         width = 420
         height = 160
         margin = 32
         if x_axis.size == 0:
             target.clear()
             return
-        y_min = float(min(np.min(profile), np.min(fit_curve)))
-        y_max = float(max(np.max(profile), np.max(fit_curve)))
+        unit = getattr(self, "_fit_plot_unit", "mm")
+        if unit == "mm" and length_mm > 0:
+            scale = length_mm / max(float(x_axis[-1]), 1e-9)
+            x_display = x_axis * scale
+            unit_label = "mm"
+        else:
+            x_display = x_axis
+            unit_label = "px"
+        zoom = float(getattr(self, "_fit_plot_zoom", 1.0))
+        x_min_full = float(x_display[0])
+        x_max_full = float(x_display[-1])
+        span_full = max(x_max_full - x_min_full, 1e-9)
+        span_zoom = span_full / max(zoom, 1.0)
+        center = 0.5 * (x_min_full + x_max_full)
+        x_min = max(x_min_full, center - 0.5 * span_zoom)
+        x_max = min(x_max_full, center + 0.5 * span_zoom)
+        mask = (x_display >= x_min) & (x_display <= x_max)
+        if np.count_nonzero(mask) < 2:
+            mask = np.ones_like(x_display, dtype=bool)
+            x_min = x_min_full
+            x_max = x_max_full
+        x_plot = x_display[mask]
+        profile_plot = profile[mask]
+        fit_plot = fit_curve[mask]
+
+        y_min = float(min(np.min(profile_plot), np.min(fit_plot)))
+        y_max = float(max(np.max(profile_plot), np.max(fit_plot)))
         if y_max - y_min < 1e-6:
             y_max = y_min + 1.0
         def scale_x(x):
-            return margin + (x - x_axis[0]) / max(1e-9, x_axis[-1] - x_axis[0]) * (width - 2 * margin)
+            return margin + (x - x_min) / max(1e-9, x_max - x_min) * (width - 2 * margin)
         def scale_y(y):
             return height - margin - (y - y_min) / (y_max - y_min) * (height - 2 * margin)
 
@@ -3330,30 +3523,59 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.drawRect(margin, margin, width - 2 * margin, height - 2 * margin)
 
         painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255), 2))
-        for i in range(1, len(x_axis)):
+        for i in range(1, len(x_plot)):
             painter.drawLine(
-                QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(profile[i - 1])),
-                QtCore.QPointF(scale_x(x_axis[i]), scale_y(profile[i])),
+                QtCore.QPointF(scale_x(x_plot[i - 1]), scale_y(profile_plot[i - 1])),
+                QtCore.QPointF(scale_x(x_plot[i]), scale_y(profile_plot[i])),
             )
         painter.setPen(QtGui.QPen(QtGui.QColor(255, 150, 0), 2))
-        for i in range(1, len(x_axis)):
+        for i in range(1, len(x_plot)):
             painter.drawLine(
-                QtCore.QPointF(scale_x(x_axis[i - 1]), scale_y(fit_curve[i - 1])),
-                QtCore.QPointF(scale_x(x_axis[i]), scale_y(fit_curve[i])),
+                QtCore.QPointF(scale_x(x_plot[i - 1]), scale_y(fit_plot[i - 1])),
+                QtCore.QPointF(scale_x(x_plot[i]), scale_y(fit_plot[i])),
             )
         painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180), 1))
-        waist_diam_mm = waist_mm * 2.0
-        painter.drawText(margin, margin - 6, f"{title} | 2*w={waist_diam_mm:.3f}mm, FWHM={fwhm_mm:.3f}mm")
+        x_axis_span_px = float(max(x_axis[-1], 1e-9))
+        if unit_label == "mm":
+            waist_val = waist_mm
+            fwhm_val = fwhm_mm
+        else:
+            if length_mm > 0:
+                px_per_mm = x_axis_span_px / length_mm
+                waist_val = waist_mm * px_per_mm
+                fwhm_val = fwhm_mm * px_per_mm
+            else:
+                waist_val = waist_mm
+                fwhm_val = fwhm_mm
+        waist_diam_val = waist_val * 2.0
         painter.drawText(
-            width // 2 - 70,
-            height - 6,
-            f"0-{x_axis[-1]:.1f}px ({max(length_mm,0):.3f}mm)",
+            margin,
+            margin - 6,
+            f"{title} | 2*w={waist_diam_val:.3f}{unit_label}, FWHM={fwhm_val:.3f}{unit_label}",
         )
+        span = max(x_max - x_min, 1e-9)
+        if unit_label == "mm":
+            tick_fmt = "{:.3f}" if span < 1.0 else "{:.2f}"
+        else:
+            tick_fmt = "{:.1f}" if span < 20 else "{:.0f}"
+        ticks = np.linspace(x_min, x_max, 5)
+        for tick in ticks:
+            x_pos = scale_x(float(tick))
+            painter.drawLine(QtCore.QPointF(x_pos, height - margin), QtCore.QPointF(x_pos, height - margin + 4))
+            painter.drawText(QtCore.QPointF(x_pos - 12.0, height - 6.0), tick_fmt.format(tick))
+
+        yticks = np.linspace(y_min, y_max, 3)
+        for tick in yticks:
+            y_pos = scale_y(float(tick))
+            painter.drawLine(QtCore.QPointF(margin - 4, y_pos), QtCore.QPointF(margin, y_pos))
+            painter.drawText(QtCore.QPointF(4.0, y_pos + 4.0), f"{tick:.1f}")
+
         painter.save()
         painter.translate(12, height // 2 + 28)
         painter.rotate(-90)
         painter.drawText(0, 0, "Intensity (gray level)")
         painter.restore()
+        painter.drawText(QtCore.QPointF(width / 2 - 30.0, height - 18.0), f"Distance ({unit_label})")
         painter.end()
         target.setPixmap(QtGui.QPixmap.fromImage(img))
 
