@@ -3324,10 +3324,29 @@ class CameraApp(QtWidgets.QMainWindow):
                 data = np.mean(data, axis=2)
             else:
                 data = np.mean(data, axis=2)
-        hist, _ = np.histogram(data.flatten(), bins=256, range=[0, 255])
+        axis_max = 255
+        camera_bit_depth = None
+        if self.camera and not (self._use_cv or self._use_pylon):
+            try:
+                camera_bit_depth = int(getattr(self.camera, "bit_depth", 8))
+            except Exception:
+                camera_bit_depth = None
+        if camera_bit_depth:
+            axis_max = max(1, (1 << camera_bit_depth) - 1)
+        elif np.issubdtype(data.dtype, np.integer):
+            try:
+                axis_max = int(np.iinfo(data.dtype).max)
+            except Exception:
+                axis_max = 255
+        axis_max = max(1, axis_max)
+        scaled_to_8bit = bool(camera_bit_depth and camera_bit_depth > 8)
+        hist_range_max = 255 if scaled_to_8bit else axis_max
+
+        hist, _ = np.histogram(data.flatten(), bins=256, range=[0, hist_range_max])
         hist = hist.astype(np.float64)
-        if hist.max() > 0:
-            hist = hist / hist.max()
+        hist_max = float(hist.max()) if hist.size else 0.0
+        hist_scale = hist_max if hist_max > 0 else 1.0
+        hist_norm = hist / hist_scale
 
         width = self._hist_size.width()
         height = self._hist_size.height()
@@ -3340,15 +3359,82 @@ class CameraApp(QtWidgets.QMainWindow):
         image.fill(QtCore.Qt.GlobalColor.transparent)
         painter = QtGui.QPainter(image)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        bg_color = QtGui.QColor(10, 10, 10, 180)  # translucent dark backdrop for contrast
+        bg_color = QtGui.QColor(0, 0, 0, 255)  # black background
         painter.fillRect(0, 0, width, height, bg_color)
-        bar_color = QtGui.QColor(0, 190, 255, 220)  # semi-transparent cyan bars
+
+        left = 44
+        right = 10
+        top = 8
+        bottom = 24
+        if width - left - right < 20:
+            left = max(10, width - right - 20)
+        if height - top - bottom < 20:
+            bottom = max(10, height - top - 20)
+        plot_w = max(1, width - left - right)
+        plot_h = max(1, height - top - bottom)
+
+        bar_color = QtGui.QColor(255, 215, 0, 255)  # warm yellow bars
         painter.setPen(QtGui.QPen(bar_color, 1))
-        painter.setBrush(bar_color)
-        for i, v in enumerate(hist):
-            x = i
-            bar_height = int(v * (height - 12))
-            painter.drawRect(x, height - bar_height - 2, 1, bar_height)
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        if hist_max > 0:
+            for i, v in enumerate(hist_norm):
+                bar_height = int(v * plot_h)
+                if bar_height <= 0:
+                    continue
+                x = left + int((i + 0.5) * plot_w / 256)
+                x = max(left, min(left + plot_w - 1, x))
+                painter.drawLine(x, top + plot_h, x, top + plot_h - bar_height)
+
+        axis_pen = QtGui.QPen(QtGui.QColor(80, 80, 80), 1)
+        text_pen = QtGui.QPen(QtGui.QColor(210, 210, 210), 1)
+        font = painter.font()
+        font.setPointSize(max(7, font.pointSize() - 1))
+        painter.setFont(font)
+
+        painter.setPen(axis_pen)
+        painter.drawRect(left, top, plot_w, plot_h)
+
+        y_ticks = [0, hist_scale / 2, hist_scale] if hist_max > 0 else [0]
+        for val in y_ticks:
+            y = top + plot_h - int((val / hist_scale) * plot_h)
+            painter.setPen(axis_pen)
+            painter.drawLine(left - 4, y, left, y)
+            painter.setPen(text_pen)
+            label = f"{int(round(val))}"
+            painter.drawText(
+                QtCore.QRectF(0, y - 7, left - 6, 14),
+                QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                label,
+            )
+
+        axis_range = axis_max + 1
+        if axis_range & (axis_range - 1) == 0:
+            bit_depth = axis_range.bit_length() - 1
+            base = 1 << max(bit_depth - 2, 0)
+            x_ticks = [0, base, base * 2, base * 3, axis_max]
+        else:
+            x_ticks = [
+                0,
+                axis_max // 4,
+                axis_max // 2,
+                (3 * axis_max) // 4,
+                axis_max,
+            ]
+        metrics = painter.fontMetrics()
+        for val in x_ticks:
+            x = left + int((val / axis_max) * plot_w)
+            painter.setPen(axis_pen)
+            painter.drawLine(x, top + plot_h, x, top + plot_h + 4)
+            painter.setPen(text_pen)
+            label = str(val)
+            text_w = metrics.horizontalAdvance(label)
+            text_x = max(0, min(x - text_w // 2, width - text_w))
+            painter.drawText(
+                QtCore.QRectF(text_x, top + plot_h + 4, text_w, bottom - 4),
+                QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop,
+                label,
+            )
+
         painter.end()
         return QtGui.QPixmap.fromImage(image)
 
