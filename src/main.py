@@ -1364,7 +1364,7 @@ class CameraApp(QtWidgets.QMainWindow):
     def _load_fft_settings(self):
         if not getattr(self, "_settings", None):
             return
-        enabled = self._settings.value("fft/clean_enabled", False, type=bool)
+        enabled = False
         steps_enabled = self._settings.value("fft/steps_enabled", False, type=bool)
         params = {
             "fft/dc_radius": 10,

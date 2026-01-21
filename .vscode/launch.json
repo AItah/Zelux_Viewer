@@ -1,7 +1,6 @@
 {
     "version": "0.2.0",
     "configurations": [
-
         {
             "name": "Python Run/Debugger: Current File",  // Custom name for the configuration
             "type": "debugpy",  // Use debugpy for Python debugging (required now)
