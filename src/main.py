@@ -298,6 +298,52 @@ class ImageLabel(QtWidgets.QLabel):
         super().mouseReleaseEvent(event)
 
 
+class HistogramView(QtWidgets.QGraphicsView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QtWidgets.QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pixmap_item = QtWidgets.QGraphicsPixmapItem()
+        self._scene.addItem(self._pixmap_item)
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        self.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+        self.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._user_zoomed = False
+        self._min_zoom = 0.2
+        self._max_zoom = 12.0
+
+    def set_histogram_pixmap(self, pixmap: QtGui.QPixmap):
+        if pixmap is None or pixmap.isNull():
+            return
+        self._pixmap_item.setPixmap(pixmap)
+        self._scene.setSceneRect(QtCore.QRectF(pixmap.rect()))
+        if not self._user_zoomed:
+            self.fitInView(self._pixmap_item, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        current = self.transform().m11()
+        factor = 1.15 if delta > 0 else 1 / 1.15
+        target = max(self._min_zoom, min(self._max_zoom, current * factor))
+        if abs(target - current) < 1e-6:
+            event.accept()
+            return
+        self._user_zoomed = True
+        self.scale(target / current, target / current)
+        event.accept()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        super().resizeEvent(event)
+        if not self._user_zoomed and not self._pixmap_item.pixmap().isNull():
+            self.fitInView(self._pixmap_item, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+
 class OverlayPanel(QtWidgets.QFrame):
     """Floating panel that can be dragged (via header) and resized (via size grip)."""
 
@@ -1044,10 +1090,11 @@ class CameraApp(QtWidgets.QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
 
-        self.hist_label = QtWidgets.QLabel(window)
-        self.hist_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.hist_label.setStyleSheet("background-color: transparent;")
-        layout.addWidget(self.hist_label)
+        self.hist_view = HistogramView(window)
+        self.hist_view.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
+        )
+        layout.addWidget(self.hist_view)
 
         grip_row = QtWidgets.QHBoxLayout()
         grip_row.addStretch(1)
@@ -3242,7 +3289,7 @@ class CameraApp(QtWidgets.QMainWindow):
         label.setText(text + ref_text)
 
     def _update_histogram_window(self, payload: Optional[FramePayload]):
-        if not getattr(self, "hist_window", None):
+        if not getattr(self, "hist_window", None) or not getattr(self, "hist_view", None):
             return
         if self._in_hist_update:
             return
@@ -3252,10 +3299,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self._in_hist_update = True
         try:
             pixmap = self._build_histogram_pixmap(payload)
-            self.hist_label.setPixmap(pixmap)
-            self.hist_label.adjustSize()
-            self.hist_window.adjustSize()
-            self._hist_size = self.hist_window.size()
+            self.hist_view.set_histogram_pixmap(pixmap)
             if not self._hist_window_positioned:
                 anchor_geom = None
                 if getattr(self, "controls_window", None):
@@ -3285,7 +3329,13 @@ class CameraApp(QtWidgets.QMainWindow):
         if hist.max() > 0:
             hist = hist / hist.max()
 
-        width, height = max(120, self._hist_size.width()), max(80, self._hist_size.height())
+        width = self._hist_size.width()
+        height = self._hist_size.height()
+        if getattr(self, "hist_view", None):
+            view_size = self.hist_view.viewport().size()
+            if view_size.width() > 0 and view_size.height() > 0:
+                width, height = view_size.width(), view_size.height()
+        width, height = max(120, width), max(80, height)
         image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_ARGB32)
         image.fill(QtCore.Qt.GlobalColor.transparent)
         painter = QtGui.QPainter(image)
@@ -5367,7 +5417,10 @@ class CameraApp(QtWidgets.QMainWindow):
     def eventFilter(self, obj, event):
         if obj is getattr(self, "hist_window", None):
             if event.type() == QtCore.QEvent.Type.Resize:
-                new_size = obj.size()
+                if getattr(self, "hist_view", None):
+                    new_size = self.hist_view.viewport().size()
+                else:
+                    new_size = obj.size()
                 if new_size.width() > 0 and new_size.height() > 0:
                     self._hist_size = new_size
                     if self._histogram_enabled and self.last_payload:
