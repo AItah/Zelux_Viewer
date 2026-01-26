@@ -28,6 +28,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--show-status", action="store_true", help="Print status messages.")
     parser.add_argument("--window-name", default="Camera Subscriber", help="OpenCV window title.")
     parser.add_argument("--rcv-hwm", type=int, default=2, help="ZMQ receive high-water mark.")
+    parser.add_argument("--poll-ms", type=int, default=50, help="Poll timeout (ms) for UI responsiveness.")
     return parser.parse_args()
 
 
@@ -79,6 +80,9 @@ def main() -> int:
     if args.show_status and args.status_topic:
         socket.setsockopt_string(zmq.SUBSCRIBE, args.status_topic)
 
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+
     print(f"Connected to {args.endpoint}")
     print(f"Subscribed to topic: {args.topic}")
     if args.show_status:
@@ -89,6 +93,12 @@ def main() -> int:
 
     try:
         while True:
+            events = dict(poller.poll(max(1, int(args.poll_ms))))
+            if socket not in events:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    break
+                continue
             parts = socket.recv_multipart()
             if len(parts) < 3:
                 continue
