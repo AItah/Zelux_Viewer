@@ -4,7 +4,7 @@
   "mode": "bind",
   "topic": "camera",
   "status_topic": "camera/status",
-  "format": "gray8",
+  "format": "auto",
   "compress": false,
   "jpeg_quality": 80,
   "fps_limit": null,

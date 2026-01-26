@@ -23,6 +23,13 @@ def _to_uint8(array: np.ndarray) -> np.ndarray:
 
 
 def _convert_format(frame: np.ndarray, target_format: str) -> tuple[np.ndarray, str]:
+    if target_format == "auto":
+        if frame.ndim == 2:
+            target_format = "gray8"
+        elif frame.ndim == 3 and frame.shape[2] == 3:
+            target_format = "rgb8"
+        else:
+            raise PublisherError(f"Unsupported frame shape for publishing: {frame.shape}")
     if frame.ndim == 2:
         gray = _to_uint8(frame)
         if target_format == "gray8":

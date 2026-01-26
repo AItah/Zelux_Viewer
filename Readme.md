@@ -7,7 +7,7 @@ python -m pip install "C:\...\thorlabs_tsi_camera_python_sdk_package.zip"
 Python_README.txt
 
 - generate exe:</br>
-pyinstaller --name ZeluxViewer --onefile --windowed --add-binary "dlls/64_lib/*.dll;dlls/64_lib" " \Zelux_Viewer\src\main.py"
+pyinstaller --name ZeluxViewer --onefile --windowed --add-binary "dlls/64_lib/*.dll;dlls/64_lib" "src\main.py"
 
 ## Features
 - Live view with start/stop controls, save/load image, and grayscale toggle.

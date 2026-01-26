@@ -806,6 +806,8 @@ class CameraApp(QtWidgets.QMainWindow):
         self.publisher_enabled = False
         self.publisher_error = None
         self.publisher_last_error = None
+        self.publish_info_window = None
+        self.publish_info_label = None
         try:
             self.publisher_config, self.publisher_config_path = load_publisher_config()
             self.publisher_enabled = bool(self.publisher_config.enabled)
@@ -1040,6 +1042,8 @@ class CameraApp(QtWidgets.QMainWindow):
 
         self.calibration_window = self._build_calibration_window()
         self.calibration_window.installEventFilter(self)
+        self.publish_info_window = self._build_publish_info_window()
+        self.publish_info_window.installEventFilter(self)
 
         self._restore_window_state(self.hist_window, "hist_window")
         self._restore_window_state(self.fit_window, "fit_window")
@@ -1049,6 +1053,7 @@ class CameraApp(QtWidgets.QMainWindow):
         fft_mask_restored = self._restore_window_state(self.fft_mask_window, "fft_mask_window")
         fft_ifft_restored = self._restore_window_state(self.fft_ifft_window, "fft_ifft_window")
         calib_restored = self._restore_window_state(self.calibration_window, "calibration_window")
+        self._restore_window_state(self.publish_info_window, "publish_info_window")
         self._apply_fft_window_limits(self.fft_mag_window)
         self._apply_fft_window_limits(self.fft_mask_window)
         self._apply_fft_window_limits(self.fft_ifft_window)
@@ -1084,6 +1089,9 @@ class CameraApp(QtWidgets.QMainWindow):
             self.measure_checkbox.blockSignals(True)
             self.measure_checkbox.setChecked(True)
             self.measure_checkbox.blockSignals(False)
+        if self.publish_info_window and not self.publisher_enabled:
+            self.publish_info_window.hide()
+        self._update_publish_info_window()
 
         self._sync_panning_enabled()
 
@@ -2086,6 +2094,73 @@ class CameraApp(QtWidgets.QMainWindow):
         row.addStretch(1)
         return row
 
+    def _build_publish_info_window(self) -> QtWidgets.QWidget:
+        window = QtWidgets.QWidget(None, QtCore.Qt.WindowType.Window)
+        window.setWindowTitle("Publisher Info")
+        window.resize(460, 360)
+
+        layout = QtWidgets.QVBoxLayout(window)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.publish_info_label = QtWidgets.QLabel("")
+        self.publish_info_label.setWordWrap(True)
+        self.publish_info_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        try:
+            fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
+            self.publish_info_label.setFont(fixed_font)
+        except Exception:
+            pass
+        layout.addWidget(self.publish_info_label)
+
+        window.hide()
+        return window
+
+    def _update_publish_info_window(self):
+        if not getattr(self, "publish_info_label", None):
+            return
+        lines = []
+        status = "on" if self.publisher_enabled else "off"
+        if self.publisher_error:
+            status = f"error (config): {self.publisher_error}"
+        elif self.publisher_last_error:
+            status = f"error: {self.publisher_last_error}"
+        lines.append(f"status: {status}")
+
+        if self.publisher_config_path:
+            try:
+                config_path = Path(self.publisher_config_path)
+                lines.append(f"config_path: {config_path}")
+                lines.append(f"config_exists: {config_path.exists()}")
+            except Exception:
+                lines.append(f"config_path: {self.publisher_config_path}")
+
+        if self.publisher_config:
+            cfg = self.publisher_config
+            fmt = cfg.format
+            if fmt == "auto":
+                fmt = "auto (gray8 for mono, rgb8 for color)"
+            fps_limit = "none" if not cfg.fps_limit else f"{cfg.fps_limit:.2f}"
+            lines.extend(
+                [
+                    f"endpoint: {cfg.endpoint}",
+                    f"mode: {cfg.mode}",
+                    f"topic: {cfg.topic}",
+                    f"status_topic: {cfg.status_topic}",
+                    f"format: {fmt}",
+                    f"compress: {cfg.compress}",
+                    f"jpeg_quality: {cfg.jpeg_quality}",
+                    f"fps_limit: {fps_limit}",
+                    f"snd_hwm: {cfg.snd_hwm}",
+                    f"conflate: {cfg.conflate}",
+                    f"status_interval_s: {cfg.status_interval_s}",
+                    f"include_overlays: {cfg.include_overlays}",
+                ]
+            )
+        self.publish_info_label.setText("\n".join(lines))
+
     def _set_publish_checkbox(self, checked: bool):
         if getattr(self, "publish_checkbox", None):
             self.publish_checkbox.blockSignals(True)
@@ -2147,6 +2222,10 @@ class CameraApp(QtWidgets.QMainWindow):
         self.publisher_enabled = True
         self.publisher_config.enabled = True
         self._update_publisher_status_label("Publisher: on")
+        self._update_publish_info_window()
+        if self.publish_info_window:
+            self.publish_info_window.show()
+            self.publish_info_window.raise_()
 
     def _stop_publisher(self):
         self.publisher_enabled = False
@@ -2159,6 +2238,9 @@ class CameraApp(QtWidgets.QMainWindow):
                 pass
             self.publisher = None
         self._update_publisher_status_label("Publisher: off")
+        self._update_publish_info_window()
+        if self.publish_info_window:
+            self.publish_info_window.hide()
 
     def _publisher_extra_metadata(self) -> dict[str, Any]:
         meta: dict[str, Any] = {}
@@ -2200,8 +2282,6 @@ class CameraApp(QtWidgets.QMainWindow):
             frame_np = self._display_np_image
             if frame_np is None:
                 frame_np = self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
-            if frame_np is not None and self._force_grayscale and frame_np.ndim == 3:
-                frame_np = np.mean(frame_np, axis=2)
         if frame_np is None:
             return
         try:
@@ -2221,6 +2301,7 @@ class CameraApp(QtWidgets.QMainWindow):
     def _publisher_report_error(self, message: str):
         self.publisher_last_error = message
         self._update_publisher_status_label("Publisher: error")
+        self._update_publish_info_window()
         if self.publisher:
             try:
                 self.publisher.publish_status("error", message=message)
@@ -6305,6 +6386,9 @@ class CameraApp(QtWidgets.QMainWindow):
             if getattr(self, "calibration_window", None):
                 self._save_window_state(self.calibration_window, "calibration_window")
                 self.calibration_window.close()
+            if getattr(self, "publish_info_window", None):
+                self._save_window_state(self.publish_info_window, "publish_info_window")
+                self.publish_info_window.close()
             self._save_window_state(self, "main_window")
         except Exception:
             pass

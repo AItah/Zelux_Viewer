@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "publisher.json"
-_ALLOWED_FORMATS = {"gray8", "rgb8", "bgr8"}
+_ALLOWED_FORMATS = {"auto", "gray8", "rgb8", "bgr8"}
 _ALLOWED_MODES = {"bind", "connect"}
 
 
@@ -50,12 +51,12 @@ class PublisherConfig:
     mode: str = "bind"
     topic: str = "camera"
     status_topic: str = "camera/status"
-    format: str = "gray8"
+    format: str = "auto"
     compress: bool = False
     jpeg_quality: int = 80
     fps_limit: Optional[float] = None
-    snd_hwm: int = 2
-    conflate: bool = True
+    snd_hwm: int = 1
+    conflate: bool = False
     status_interval_s: float = 1.0
     include_overlays: bool = False
 
@@ -112,11 +113,23 @@ class PublisherConfig:
         )
 
 
+def _frozen_default_config_path() -> Optional[Path]:
+    if hasattr(sys, "_MEIPASS"):
+        exe_dir = Path(sys.executable).resolve().parent
+        return exe_dir / "config" / "publisher.json"
+    return None
+
+
 def resolve_config_path(path: str | Path | None = None) -> Path:
     if path:
         resolved = Path(path)
     else:
-        resolved = Path(os.environ.get("PUBLISHER_CONFIG", DEFAULT_CONFIG_PATH))
+        env_path = os.environ.get("PUBLISHER_CONFIG")
+        if env_path:
+            resolved = Path(env_path)
+        else:
+            frozen_path = _frozen_default_config_path()
+            resolved = frozen_path if frozen_path is not None else DEFAULT_CONFIG_PATH
     if not resolved.is_absolute():
         resolved = (Path.cwd() / resolved).resolve()
     return resolved
