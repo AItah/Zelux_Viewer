@@ -31,3 +31,9 @@ pyinstaller --name ZeluxViewer --onefile --windowed --add-binary "dlls/64_lib/*.
 - **Filters**: Choose None/Low-pass/High-pass/Band-pass and adjust low/high cutoffs (Nyquist fractions). Applied to image, histogram, and all fits/exports.
 - **SciPy Fit**: Press SciPy Fit to auto-center, fit horizontal/vertical profiles (Gaussian vs. Lorentzian via AIC), and draw the waist ellipse. For a custom slice, click 2-Point Line Fit, pick two points (drag to refine), then press SciPy Fit again to fit that line and export the profile CSV + frame.**
 - **Save**: Pick a filename; the app creates `<chosen_dir>/<timestamp>/` containing the displayed image with overlays, `line_plot.png`, `axis_h.png`, `axis_v.png` (when present), and `cross_sections.csv` with the raw profiles used in the latest fits.***
+
+
+## how to launch the subscriber
+- open terminal (inside venv)
+launch:
+python test_app/zmq_camera_subscriber.py --endpoint tcp://127.0.0.1:5555 --show-status
