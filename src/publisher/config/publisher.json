@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "endpoint": "tcp://127.0.0.1:5555",
+  "mode": "bind",
+  "topic": "camera",
+  "status_topic": "camera/status",
+  "format": "gray8",
+  "compress": false,
+  "jpeg_quality": 80,
+  "fps_limit": null,
+  "snd_hwm": 2,
+  "conflate": true,
+  "status_interval_s": 1.0,
+  "include_overlays": false
+}

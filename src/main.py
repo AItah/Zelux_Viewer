@@ -23,12 +23,21 @@ import threading
 import time
 import csv
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from publisher.config import PublisherConfigError, load_publisher_config
+try:
+    from publisher.zmq_publisher import PublisherError, ZmqFramePublisher
+
+    _HAVE_PUBLISHER = True
+except Exception:
+    _HAVE_PUBLISHER = False
+    PublisherError = RuntimeError
+    ZmqFramePublisher = None
 try:
     import cv2  # Optional: used for generic DirectShow cameras
 
@@ -791,6 +800,17 @@ class CameraApp(QtWidgets.QMainWindow):
         self._fit_plot_cache_line: Optional[dict] = None
         self._fit_plot_cache_axis: dict[str, Optional[dict]] = {"H": None, "V": None}
         self._settings = QtCore.QSettings("BaslerTool", "Viewer")
+        self.publisher = None
+        self.publisher_config = None
+        self.publisher_config_path = None
+        self.publisher_enabled = False
+        self.publisher_error = None
+        self.publisher_last_error = None
+        try:
+            self.publisher_config, self.publisher_config_path = load_publisher_config()
+            self.publisher_enabled = bool(self.publisher_config.enabled)
+        except PublisherConfigError as exc:
+            self.publisher_error = str(exc)
         self._filtered_np_image: Optional[np.ndarray] = None
         self._pending_sections: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._last_fft_timings: Optional[dict] = None
@@ -800,6 +820,8 @@ class CameraApp(QtWidgets.QMainWindow):
         self._restore_window_state(self, "main_window")
         self.setWindowTitle("Live View - No camera")
         self._build_ui()
+        if self.publisher_error:
+            self._update_publisher_status_label("Publisher: error")
 
         self._set_camera_controls_enabled(False)
         self._connect_first_available_camera(show_message=False)
@@ -808,6 +830,8 @@ class CameraApp(QtWidgets.QMainWindow):
         self.poll_timer.setInterval(15)
         self.poll_timer.timeout.connect(self._poll_queue)
         self.poll_timer.start()
+        if self.publisher_enabled:
+            self._start_publisher()
 
     def compute_2d_gaussian_fit(self):
         """Fit a rotated 2D Gaussian spot on the current image."""
@@ -1915,6 +1939,21 @@ class CameraApp(QtWidgets.QMainWindow):
         self.measure_checkbox = QtWidgets.QCheckBox("Measure")
         self.measure_checkbox.stateChanged.connect(self.toggle_measure_window)
         row2.addWidget(self.measure_checkbox)
+        self.publish_checkbox = QtWidgets.QCheckBox("Publish")
+        publisher_ready = _HAVE_PUBLISHER and self.publisher_error is None and self.publisher_config is not None
+        self.publish_checkbox.setEnabled(publisher_ready)
+        if not publisher_ready:
+            hint = "Publisher unavailable."
+            if self.publisher_error:
+                hint = f"Publisher config error: {self.publisher_error}"
+            elif not _HAVE_PUBLISHER:
+                hint = "pyzmq not installed."
+            self.publish_checkbox.setToolTip(hint)
+        self.publish_checkbox.stateChanged.connect(self._toggle_publisher)
+        self.publish_checkbox.blockSignals(True)
+        self.publish_checkbox.setChecked(bool(self.publisher_enabled))
+        self.publish_checkbox.blockSignals(False)
+        row2.addWidget(self.publish_checkbox)
         row2.addStretch(1)
 
         layout.addLayout(row1)
@@ -2041,8 +2080,152 @@ class CameraApp(QtWidgets.QMainWindow):
         row.addWidget(self.status_label)
         row.addSpacing(12)
         row.addWidget(self.coord_label)
+        row.addSpacing(12)
+        self.publisher_status_label = QtWidgets.QLabel("Publisher: off")
+        row.addWidget(self.publisher_status_label)
         row.addStretch(1)
         return row
+
+    def _set_publish_checkbox(self, checked: bool):
+        if getattr(self, "publish_checkbox", None):
+            self.publish_checkbox.blockSignals(True)
+            self.publish_checkbox.setChecked(bool(checked))
+            self.publish_checkbox.blockSignals(False)
+
+    def _update_publisher_status_label(self, text: str):
+        if getattr(self, "publisher_status_label", None):
+            self.publisher_status_label.setText(text)
+
+    def _toggle_publisher(self, state: int):
+        try:
+            checked = QtCore.Qt.CheckState(state) == QtCore.Qt.CheckState.Checked
+        except Exception:
+            checked = bool(state)
+        if checked:
+            self._start_publisher()
+        else:
+            self._stop_publisher()
+
+    def _start_publisher(self):
+        if self.publisher and self.publisher_enabled:
+            return
+        if self.publisher_error:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Publisher error",
+                f"Publisher config error: {self.publisher_error}",
+            )
+            self._set_publish_checkbox(False)
+            return
+        if not _HAVE_PUBLISHER or ZmqFramePublisher is None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Publisher unavailable",
+                "pyzmq is not installed. Install it and restart the app.",
+            )
+            self._set_publish_checkbox(False)
+            return
+        if not self.publisher_config:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Publisher unavailable",
+                "Publisher config could not be loaded.",
+            )
+            self._set_publish_checkbox(False)
+            return
+        try:
+            self.publisher = ZmqFramePublisher(self.publisher_config)
+            self.publisher.start()
+        except Exception as exc:
+            self.publisher = None
+            self.publisher_enabled = False
+            self.publisher_last_error = str(exc)
+            QtWidgets.QMessageBox.critical(self, "Publisher error", f"Failed to start publisher: {exc}")
+            self._set_publish_checkbox(False)
+            self._update_publisher_status_label("Publisher: error")
+            return
+        self.publisher_enabled = True
+        self.publisher_config.enabled = True
+        self._update_publisher_status_label("Publisher: on")
+
+    def _stop_publisher(self):
+        self.publisher_enabled = False
+        if self.publisher_config:
+            self.publisher_config.enabled = False
+        if self.publisher:
+            try:
+                self.publisher.stop()
+            except Exception:
+                pass
+            self.publisher = None
+        self._update_publisher_status_label("Publisher: off")
+
+    def _publisher_extra_metadata(self) -> dict[str, Any]:
+        meta: dict[str, Any] = {}
+        try:
+            if self._use_cv and self.cv_thread:
+                exp_us, gain = self.cv_thread.get_props()
+                if exp_us:
+                    meta["exposure_us"] = int(exp_us)
+                if gain is not None:
+                    meta["gain_db"] = float(gain)
+            elif self._use_pylon and self.pylon_thread:
+                exp_us, gain = self.pylon_thread.get_props()
+                if exp_us:
+                    meta["exposure_us"] = int(exp_us)
+                if gain is not None:
+                    meta["gain_db"] = float(gain)
+            elif self.camera:
+                exp_us = getattr(self.camera, "exposure_time_us", None)
+                if exp_us:
+                    meta["exposure_us"] = int(exp_us)
+                gain = getattr(self.camera, "gain", None)
+                if gain is not None:
+                    meta["gain_db"] = float(gain)
+        except Exception:
+            pass
+        return meta
+
+    def _publish_current_frame(self, payload: FramePayload):
+        if not (self.publisher and self.publisher_enabled):
+            return
+        frame_np = None
+        if self.publisher_config and self.publisher_config.include_overlays:
+            try:
+                frame_np = np.array(self._prepare_display_image(payload))
+            except Exception as exc:
+                self._publisher_report_error(f"Overlay publish failed: {exc}")
+                return
+        else:
+            frame_np = self._display_np_image
+            if frame_np is None:
+                frame_np = self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
+            if frame_np is not None and self._force_grayscale and frame_np.ndim == 3:
+                frame_np = np.mean(frame_np, axis=2)
+        if frame_np is None:
+            return
+        try:
+            self.publisher.publish_frame(frame_np, extra_metadata=self._publisher_extra_metadata())
+        except Exception as exc:
+            self._publisher_report_error(f"Publish failed: {exc}")
+
+    def _publisher_tick(self):
+        if not (self.publisher and self.publisher_enabled):
+            return
+        status = "online" if self._live else "idle"
+        try:
+            self.publisher.tick(status=status)
+        except Exception as exc:
+            self._publisher_report_error(f"Status publish failed: {exc}")
+
+    def _publisher_report_error(self, message: str):
+        self.publisher_last_error = message
+        self._update_publisher_status_label("Publisher: error")
+        if self.publisher:
+            try:
+                self.publisher.publish_status("error", message=message)
+            except Exception:
+                pass
 
     def _set_camera_controls_enabled(self, enabled: bool):
         widgets = [
@@ -2327,12 +2510,14 @@ class CameraApp(QtWidgets.QMainWindow):
         if self._live:
             return
         if not self._ensure_camera():
+            self._publisher_report_error("No camera available.")
             return
         self.status_label.setText("Starting...")
         if self._use_pylon:
             if not _HAVE_PYLON or self.pylon_device_info is None:
                 QtWidgets.QMessageBox.critical(self, "Error", "Pylon SDK not available or device missing.")
                 self.status_label.setText("Failed to start")
+                self._publisher_report_error("Pylon SDK not available or device missing.")
                 return
             try:
                 self.pylon_thread = PylonVideoThread(self.pylon_device_info)
@@ -2350,15 +2535,18 @@ class CameraApp(QtWidgets.QMainWindow):
                 self.pylon_thread = None
                 QtWidgets.QMessageBox.critical(self, "Error", f"Failed to start Pylon stream: {exc}")
                 self.status_label.setText("Failed to start")
+                self._publisher_report_error(f"Failed to start Pylon stream: {exc}")
                 return
         if self._use_cv:
             if not _HAVE_OPENCV:
                 QtWidgets.QMessageBox.critical(self, "Error", "OpenCV not installed.")
                 self.status_label.setText("Failed to start")
+                self._publisher_report_error("OpenCV not installed.")
                 return
             if self.cv_index is None:
                 QtWidgets.QMessageBox.critical(self, "Error", "No generic camera index selected.")
                 self.status_label.setText("Failed to start")
+                self._publisher_report_error("No generic camera index selected.")
                 return
             # Quick sanity check that the capture can be opened before spinning the thread.
             test_cap = cv2.VideoCapture(self.cv_index, cv2.CAP_DSHOW) if _HAVE_OPENCV else None
@@ -2367,6 +2555,7 @@ class CameraApp(QtWidgets.QMainWindow):
                     test_cap.release()
                 QtWidgets.QMessageBox.critical(self, "Error", f"Could not open DirectShow #{self.cv_index}.")
                 self.status_label.setText("Failed to start")
+                self._publisher_report_error(f"Could not open DirectShow #{self.cv_index}.")
                 return
             test_cap.release()
             self.cv_thread = GenericVideoThread(self.cv_index)
@@ -2393,6 +2582,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 pass
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to start live view: {exc}")
             self.status_label.setText("Failed to start")
+            self._publisher_report_error(f"Failed to start live view: {exc}")
 
     def stop_live(self):
         self._live = False
@@ -2537,6 +2727,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 self._display_frame(payload)
             except queue.Empty:
                 pass
+        self._publisher_tick()
 
     def _on_exposure_slider(self, value: int):
         if not (self.camera or self._use_cv or self._use_pylon):
@@ -2673,6 +2864,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self.last_payload = payload
         self._filtered_np_image_untransformed = self._apply_image_filter_np(payload.np_image)
         self._rebuild_view_transforms()
+        self._publish_current_frame(payload)
         self._refresh_image_view()
 
     def _refresh_image_view(self):
@@ -6077,6 +6269,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self._refresh_image_view()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        self._stop_publisher()
         self.poll_timer.stop()
         self._dispose_camera()
         try:
