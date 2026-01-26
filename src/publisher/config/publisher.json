@@ -8,8 +8,8 @@
   "compress": false,
   "jpeg_quality": 80,
   "fps_limit": null,
-  "snd_hwm": 2,
-  "conflate": true,
+  "snd_hwm": 1,
+  "conflate": false,
   "status_interval_s": 1.0,
   "include_overlays": false
 }
