@@ -195,6 +195,7 @@ class ImageAcquisitionThread(threading.Thread):
         return self._queue
 
     def _convert_frame(self, frame: Frame) -> FramePayload:
+        raw_image = np.array(frame.image_buffer, copy=True)
         if self._is_color:
             color_image_data = self._mono_to_color_processor.transform_to_24(
                 frame.image_buffer,
@@ -207,13 +208,16 @@ class ImageAcquisitionThread(threading.Thread):
             pil_image = Image.fromarray(color_image_data, mode="RGB")
             np_image = color_image_data
         else:
-            scaled_image = frame.image_buffer >> (self._bit_depth - 8)
-            np_image = scaled_image
-            pil_image = Image.fromarray(scaled_image)
+            if self._bit_depth > 8:
+                scaled_image = raw_image >> (self._bit_depth - 8)
+            else:
+                scaled_image = raw_image
+            np_image = scaled_image.astype(np.uint8, copy=False)
+            pil_image = Image.fromarray(np_image, mode="L")
         return FramePayload(
             pil_image=pil_image,
             np_image=np_image,
-            np_image_raw=np_image,
+            np_image_raw=raw_image,
             frame_count=frame.frame_count,
         )
 
@@ -3232,10 +3236,12 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _display_frame(self, payload: FramePayload):
         raw_np = getattr(payload, "np_image_raw", None)
+        display_np = payload.np_image
         if raw_np is None:
-            raw_np = payload.np_image
+            raw_np = display_np
         if self._crop_enabled and self._crop_rect is not None:
-            h, w = raw_np.shape[:2]
+            base_np = raw_np if raw_np is not None else display_np
+            h, w = base_np.shape[:2]
             x0, y0, x1, y1 = self._crop_rect
             x0 = max(0, min(int(x0), w - 1))
             y0 = max(0, min(int(y0), h - 1))
@@ -3250,13 +3256,22 @@ class CameraApp(QtWidgets.QMainWindow):
                 if (x0, y0, x1, y1) != self._crop_rect:
                     self._crop_rect = (x0, y0, x1, y1)
                     self._update_crop_label()
-                raw_np = raw_np[y0:y1, x0:x1] if raw_np.ndim == 2 else raw_np[y0:y1, x0:x1, :]
-        payload.np_image = raw_np
-        payload.pil_image = self._np_to_pil_image(raw_np)
+                if raw_np is not None:
+                    raw_np = raw_np[y0:y1, x0:x1] if raw_np.ndim == 2 else raw_np[y0:y1, x0:x1, :]
+                if display_np is not None:
+                    display_np = (
+                        display_np[y0:y1, x0:x1]
+                        if display_np.ndim == 2
+                        else display_np[y0:y1, x0:x1, :]
+                    )
+        payload.np_image_raw = raw_np
+        payload.np_image = display_np
+        payload.pil_image = self._np_to_pil_image(display_np)
         self._last_fft_timings = None
         if getattr(self, "_fft_enabled", False):
             try:
                 from beam_profile_fitting import fft_clean_image, fft_clean_image_steps
+                process_np = display_np
                 mask_radius = int(getattr(self, "fft_mask_radius_spin", None).value()) if getattr(self, "fft_mask_radius_spin", None) else 8
                 threshold_sigma = float(getattr(self, "fft_sigma_spin", None).value()) if getattr(self, "fft_sigma_spin", None) else 5.0
                 dc_radius = int(getattr(self, "fft_dc_radius_spin", None).value()) if getattr(self, "fft_dc_radius_spin", None) else 10
@@ -3270,14 +3285,14 @@ class CameraApp(QtWidgets.QMainWindow):
                     x0, y0, x1, y1 = roi
                     x0 = max(0, int(x0))
                     y0 = max(0, int(y0))
-                    x1 = min(int(x1), raw_np.shape[1] if raw_np.ndim >= 2 else int(x1))
-                    y1 = min(int(y1), raw_np.shape[0] if raw_np.ndim >= 2 else int(y1))
+                    x1 = min(int(x1), process_np.shape[1] if process_np.ndim >= 2 else int(x1))
+                    y1 = min(int(y1), process_np.shape[0] if process_np.ndim >= 2 else int(y1))
                     if x1 - x0 < 5 or y1 - y0 < 5:
                         roi = None
                     else:
                         pad = max(16, mask_radius * 4, dc_radius * 2)
-                        width = raw_np.shape[1] if raw_np.ndim >= 2 else x1
-                        height = raw_np.shape[0] if raw_np.ndim >= 2 else y1
+                        width = process_np.shape[1] if process_np.ndim >= 2 else x1
+                        height = process_np.shape[0] if process_np.ndim >= 2 else y1
                         x0p, x1p = self._expand_bounds(x0, x1, width, pad)
                         y0p, y1p = self._expand_bounds(y0, y1, height, pad)
                         roi = (x0, y0, x1, y1, x0p, y0p, x1p, y1p)
@@ -3285,7 +3300,7 @@ class CameraApp(QtWidgets.QMainWindow):
                 if getattr(self, "_fft_steps_enabled", False):
                     if roi is None:
                         cleaned, steps = fft_clean_image_steps(
-                            raw_np,
+                            process_np,
                             mask_radius=mask_radius,
                             threshold_sigma=threshold_sigma,
                             dc_radius=dc_radius,
@@ -3297,9 +3312,9 @@ class CameraApp(QtWidgets.QMainWindow):
                     else:
                         x0, y0, x1, y1, x0p, y0p, x1p, y1p = roi
                         sub = (
-                            raw_np[y0p:y1p, x0p:x1p]
-                            if raw_np.ndim == 2
-                            else raw_np[y0p:y1p, x0p:x1p, :]
+                            process_np[y0p:y1p, x0p:x1p]
+                            if process_np.ndim == 2
+                            else process_np[y0p:y1p, x0p:x1p, :]
                         )
                         cleaned_sub, steps = fft_clean_image_steps(
                             sub,
@@ -3311,7 +3326,7 @@ class CameraApp(QtWidgets.QMainWindow):
                             max_pairs=max_pairs,
                             analysis_scale=analysis_scale,
                         )
-                        cleaned = raw_np.copy()
+                        cleaned = process_np.copy()
                         if cleaned.ndim == 2:
                             cleaned[y0:y1, x0:x1] = cleaned_sub[
                                 y0 - y0p : y1 - y0p, x0 - x0p : x1 - x0p
@@ -3324,7 +3339,7 @@ class CameraApp(QtWidgets.QMainWindow):
                     steps = {"timings": None}
                     if roi is None:
                         cleaned = fft_clean_image(
-                            raw_np,
+                            process_np,
                             mask_radius=mask_radius,
                             threshold_sigma=threshold_sigma,
                             dc_radius=dc_radius,
@@ -3336,9 +3351,9 @@ class CameraApp(QtWidgets.QMainWindow):
                     else:
                         x0, y0, x1, y1, x0p, y0p, x1p, y1p = roi
                         sub = (
-                            raw_np[y0p:y1p, x0p:x1p]
-                            if raw_np.ndim == 2
-                            else raw_np[y0p:y1p, x0p:x1p, :]
+                            process_np[y0p:y1p, x0p:x1p]
+                            if process_np.ndim == 2
+                            else process_np[y0p:y1p, x0p:x1p, :]
                         )
                         cleaned_sub = fft_clean_image(
                             sub,
@@ -3350,7 +3365,7 @@ class CameraApp(QtWidgets.QMainWindow):
                             max_pairs=max_pairs,
                             analysis_scale=analysis_scale,
                         )
-                        cleaned = raw_np.copy()
+                        cleaned = process_np.copy()
                         if cleaned.ndim == 2:
                             cleaned[y0:y1, x0:x1] = cleaned_sub[
                                 y0 - y0p : y1 - y0p, x0 - x0p : x1 - x0p
@@ -4034,9 +4049,12 @@ class CameraApp(QtWidgets.QMainWindow):
             self._in_hist_update = False
 
     def _build_histogram_pixmap(self, payload: FramePayload) -> QtGui.QPixmap:
-        data = self._display_np_image if self._display_np_image is not None else (
+        display_data = self._display_np_image if self._display_np_image is not None else (
             self._filtered_np_image if self._filtered_np_image is not None else payload.np_image
         )
+        raw_data = getattr(payload, "np_image_raw", None)
+        data = raw_data if raw_data is not None else display_data
+        using_raw = raw_data is not None
         if data.ndim == 3:
             if self._force_grayscale:
                 data = np.mean(data, axis=2)
@@ -4057,7 +4075,7 @@ class CameraApp(QtWidgets.QMainWindow):
             except Exception:
                 axis_max = 255
         axis_max = max(1, axis_max)
-        scaled_to_8bit = bool(camera_bit_depth and camera_bit_depth > 8)
+        scaled_to_8bit = bool(camera_bit_depth and camera_bit_depth > 8 and not using_raw)
         hist_range_max = 255 if scaled_to_8bit else axis_max
 
         hist, _ = np.histogram(data.flatten(), bins=256, range=[0, hist_range_max])
@@ -5365,7 +5383,9 @@ class CameraApp(QtWidgets.QMainWindow):
             filtered = np.asarray(filtered, dtype=data.dtype)
         return filtered
 
-    def _apply_view_transform_np(self, data: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    def _apply_view_transform_np(
+        self, data: Optional[np.ndarray], preserve_dtype: bool = False
+    ) -> Optional[np.ndarray]:
         """Apply mirror/rotation for display and interaction coordinates."""
         if data is None:
             return None
@@ -5388,6 +5408,9 @@ class CameraApp(QtWidgets.QMainWindow):
             k = (int(round(angle)) // 90) % 4
             return np.rot90(result, k=-k)  # negative to match PIL direction
 
+        if preserve_dtype and _HAVE_OPENCV:
+            return self._rotate_with_cv2(result, angle)
+
         # Arbitrary angle: use PIL with padding to keep full content.
         pil_mode = "RGB" if (result.ndim == 3 and result.shape[2] >= 3) else "L"
         rot_src = result
@@ -5405,15 +5428,49 @@ class CameraApp(QtWidgets.QMainWindow):
             return np.stack([result_arr] * result.shape[2], axis=2)
         return result_arr
 
+    @staticmethod
+    def _rotate_with_cv2(array: np.ndarray, angle: float) -> np.ndarray:
+        if not _HAVE_OPENCV:
+            return array
+        h, w = array.shape[:2]
+        if h <= 0 or w <= 0:
+            return array
+        center = (w / 2.0, h / 2.0)
+        matrix = cv2.getRotationMatrix2D(center, -float(angle), 1.0)
+        cos = abs(matrix[0, 0])
+        sin = abs(matrix[0, 1])
+        new_w = int(round((h * sin) + (w * cos)))
+        new_h = int(round((h * cos) + (w * sin)))
+        matrix[0, 2] += (new_w / 2.0) - center[0]
+        matrix[1, 2] += (new_h / 2.0) - center[1]
+        return cv2.warpAffine(
+            array,
+            matrix,
+            (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
     def _rebuild_view_transforms(self):
         """Recompute mirrored/rotated images from the latest frame and filtered copy."""
         if not self.last_payload:
             return
-        raw_np = self.last_payload.np_image
+        raw_np = (
+            self.last_payload.np_image_raw
+            if getattr(self.last_payload, "np_image_raw", None) is not None
+            else self.last_payload.np_image
+        )
+        display_np = self.last_payload.np_image
         filtered = self._filtered_np_image_untransformed
-        self._raw_display_np_image = self._apply_view_transform_np(raw_np)
-        self._filtered_np_image = self._apply_view_transform_np(filtered) if filtered is not None else None
-        self._display_np_image = self._filtered_np_image if self._filtered_np_image is not None else self._raw_display_np_image
+        self._raw_display_np_image = self._apply_view_transform_np(raw_np, preserve_dtype=True)
+        self._filtered_np_image = (
+            self._apply_view_transform_np(filtered) if filtered is not None else None
+        )
+        display_transformed = self._apply_view_transform_np(display_np)
+        self._display_np_image = (
+            self._filtered_np_image if self._filtered_np_image is not None else display_transformed
+        )
 
     def _sync_filter_controls(self):
         mode_text = self.filter_mode_combo.currentText() if getattr(self, "filter_mode_combo", None) else "None"
