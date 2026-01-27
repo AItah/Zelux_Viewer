@@ -855,6 +855,50 @@ class CameraApp(QtWidgets.QMainWindow):
         if self.publisher_enabled:
             self._start_publisher()
 
+    def _configure_camera_bit_depth(self) -> Optional[int]:
+        if not self.camera:
+            return None
+        candidates: list[int] = []
+        for attr in ("bit_depths", "supported_bit_depths", "bit_depth_list"):
+            vals = getattr(self.camera, attr, None)
+            if vals is None:
+                continue
+            try:
+                candidates.extend(int(v) for v in vals)
+            except Exception:
+                pass
+        getter = getattr(self.camera, "get_bit_depths", None)
+        if callable(getter):
+            try:
+                candidates.extend(int(v) for v in getter())
+            except Exception:
+                pass
+        range_obj = getattr(self.camera, "bit_depth_range", None)
+        if range_obj is not None:
+            try:
+                min_val = int(getattr(range_obj, "min", None))
+                max_val = int(getattr(range_obj, "max", None))
+                if min_val:
+                    candidates.append(min_val)
+                if max_val:
+                    candidates.append(max_val)
+            except Exception:
+                pass
+        target = max(candidates) if candidates else None
+        if target is None:
+            try:
+                return int(getattr(self.camera, "bit_depth", 0))
+            except Exception:
+                return None
+        try:
+            self.camera.bit_depth = int(target)
+            return int(getattr(self.camera, "bit_depth", target))
+        except Exception:
+            try:
+                return int(getattr(self.camera, "bit_depth", 0))
+            except Exception:
+                return None
+
     def compute_2d_gaussian_fit(self):
         """Fit a rotated 2D Gaussian spot on the current image."""
         if self.last_payload is None:
@@ -2828,8 +2872,12 @@ class CameraApp(QtWidgets.QMainWindow):
             self.pylon_device_info = None
             self.camera.frames_per_trigger_zero_for_unlimited = 0
             self.camera.image_poll_timeout_ms = 50
+            bit_depth = self._configure_camera_bit_depth()
             self.setWindowTitle(f"Live View - {self.camera.name}")
-            self.status_label.setText(f"Connected: {self.camera.name}")
+            if bit_depth:
+                self.status_label.setText(f"Connected: {self.camera.name} ({bit_depth}-bit)")
+            else:
+                self.status_label.setText(f"Connected: {self.camera.name}")
             self._configure_controls_from_camera()
             return True
         except Exception as exc:
@@ -2987,6 +3035,7 @@ class CameraApp(QtWidgets.QMainWindow):
             return
 
         try:
+            self._configure_camera_bit_depth()
             self.camera.arm(2)
             self.camera.issue_software_trigger()
             self.acq_thread = ImageAcquisitionThread(self.camera)
@@ -4078,7 +4127,11 @@ class CameraApp(QtWidgets.QMainWindow):
         scaled_to_8bit = bool(camera_bit_depth and camera_bit_depth > 8 and not using_raw)
         hist_range_max = 255 if scaled_to_8bit else axis_max
 
-        hist, _ = np.histogram(data.flatten(), bins=256, range=[0, hist_range_max])
+        try:
+            bins = int(min(max(2, int(hist_range_max) + 1), 4096))
+        except Exception:
+            bins = 256
+        hist, _ = np.histogram(data.flatten(), bins=bins, range=[0, hist_range_max])
         hist = hist.astype(np.float64)
         hist_max = float(hist.max()) if hist.size else 0.0
         hist_scale = hist_max if hist_max > 0 else 1.0
@@ -4113,11 +4166,12 @@ class CameraApp(QtWidgets.QMainWindow):
         painter.setPen(QtGui.QPen(bar_color, 1))
         painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         if hist_max > 0:
+            hist_bins = len(hist_norm)
             for i, v in enumerate(hist_norm):
                 bar_height = int(v * plot_h)
                 if bar_height <= 0:
                     continue
-                x = left + int((i + 0.5) * plot_w / 256)
+                x = left + int((i + 0.5) * plot_w / max(1, hist_bins))
                 x = max(left, min(left + plot_w - 1, x))
                 painter.drawLine(x, top + plot_h, x, top + plot_h - bar_height)
 
@@ -6691,6 +6745,7 @@ class CameraApp(QtWidgets.QMainWindow):
         img = self._display_np_image if self._display_np_image is not None else (
             self._filtered_np_image if self._filtered_np_image is not None else self.last_payload.np_image
         )
+        raw_img = self._raw_display_np_image
         scale = self._last_render_scale if self._last_render_scale else 1.0
         h, w = img.shape[:2]
         src_x = int(x / scale)
@@ -6705,12 +6760,23 @@ class CameraApp(QtWidgets.QMainWindow):
             elif img.ndim == 3:
                 gray_val = int(np.mean(img[src_y, src_x]))
             gray_suffix = f", gray: {gray_val}" if gray_val is not None else ""
+            raw_suffix = ""
+            if raw_img is not None and raw_img.shape[0] == h and raw_img.shape[1] == w:
+                raw_val = raw_img[src_y, src_x]
+                if isinstance(raw_val, np.ndarray):
+                    raw_val = raw_val.astype(int).tolist()
+                else:
+                    try:
+                        raw_val = int(raw_val)
+                    except Exception:
+                        pass
+                raw_suffix = f", raw: {raw_val}"
             # Show mm relative to the cross if set; pixels remain absolute.
             origin_x, origin_y = self.cross_pos if self.cross_pos else (0, 0)
             mm_x = (src_x - origin_x) * self.mm_per_px_x
             mm_y = (src_y - origin_y) * self.mm_per_px_y
             mm_suffix = f", x_mm: {mm_x:.3f}, y_mm: {mm_y:.3f}"
-            self.coord_label.setText(f"x: {src_x}, y: {src_y}, val: {val}{gray_suffix}{mm_suffix}")
+            self.coord_label.setText(f"x: {src_x}, y: {src_y}, val: {val}{gray_suffix}{raw_suffix}{mm_suffix}")
         else:
             self.coord_label.setText("x: -, y: -, val: -")
 
