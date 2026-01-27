@@ -578,6 +578,57 @@ def _fft_clean_channel(
     return cleaned
 
 
+def _fft_clean_color_luma(
+    image: np.ndarray,
+    mask_radius: int,
+    threshold_sigma: float,
+    dc_radius: int,
+    pair_tol: int,
+    min_sep: int,
+    max_pairs: int,
+    analysis_scale: int,
+    return_steps: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, dict] | np.ndarray:
+    """Clean color images by filtering luminance and reapplying chroma."""
+    img_float = image.astype(np.float32)
+    gray = np.mean(img_float, axis=2)
+    if return_steps:
+        cleaned_gray, mag, mask, timings = _fft_clean_channel(
+            gray,
+            mask_radius,
+            threshold_sigma,
+            dc_radius,
+            pair_tol,
+            min_sep,
+            max_pairs,
+            analysis_scale,
+            return_steps=True,
+        )
+    else:
+        cleaned_gray = _fft_clean_channel(
+            gray,
+            mask_radius,
+            threshold_sigma,
+            dc_radius,
+            pair_tol,
+            min_sep,
+            max_pairs,
+            analysis_scale,
+        )
+        mag = None
+        mask = None
+        timings = {}
+
+    eps = 1.0
+    max_gain = 4.0
+    ratio = cleaned_gray / np.maximum(gray, eps)
+    ratio = np.clip(ratio, 0.0, max_gain)
+    cleaned = img_float * ratio[:, :, None]
+    if return_steps:
+        return cleaned, mag, mask, timings
+    return cleaned
+
+
 def fft_clean_image(
     image,
     mask_radius=8,
@@ -608,20 +659,16 @@ def fft_clean_image(
             analysis_scale,
         )
     if img.ndim == 3:
-        cleaned = [
-            _fft_clean_channel(
-                img[:, :, ch],
-                mask_radius,
-                threshold_sigma,
-                dc_radius,
-                pair_tol,
-                min_sep,
-                max_pairs,
-                analysis_scale,
-            )
-            for ch in range(img.shape[2])
-        ]
-        return np.stack(cleaned, axis=2)
+        return _fft_clean_color_luma(
+            img,
+            mask_radius,
+            threshold_sigma,
+            dc_radius,
+            pair_tol,
+            min_sep,
+            max_pairs,
+            analysis_scale,
+        )
     raise ValueError("Unsupported image shape for FFT cleaning.")
 
 
@@ -654,38 +701,18 @@ def fft_clean_image_steps(
         )
         return cleaned, {"fft_mag": mag, "mask": mask, "cleaned": cleaned, "timings": timings}
     if img.ndim == 3:
-        cleaned_channels = []
-        mag = None
-        mask = None
-        cleaned_preview = None
-        timings = None
-        for ch in range(img.shape[2]):
-            if ch == 0:
-                cleaned_ch, mag, mask, timings = _fft_clean_channel(
-                    img[:, :, ch],
-                    mask_radius,
-                    threshold_sigma,
-                    dc_radius,
-                    pair_tol,
-                    min_sep,
-                    max_pairs,
-                    analysis_scale,
-                    return_steps=True,
-                )
-                cleaned_preview = cleaned_ch
-            else:
-                cleaned_ch = _fft_clean_channel(
-                    img[:, :, ch],
-                    mask_radius,
-                    threshold_sigma,
-                    dc_radius,
-                    pair_tol,
-                    min_sep,
-                    max_pairs,
-                    analysis_scale,
-                )
-            cleaned_channels.append(cleaned_ch)
-        cleaned = np.stack(cleaned_channels, axis=2)
+        cleaned, mag, mask, timings = _fft_clean_color_luma(
+            img,
+            mask_radius,
+            threshold_sigma,
+            dc_radius,
+            pair_tol,
+            min_sep,
+            max_pairs,
+            analysis_scale,
+            return_steps=True,
+        )
+        cleaned_preview = np.mean(cleaned, axis=2) if cleaned.ndim == 3 else cleaned
         return cleaned, {"fft_mag": mag, "mask": mask, "cleaned": cleaned_preview, "timings": timings}
     raise ValueError("Unsupported image shape for FFT cleaning.")
 

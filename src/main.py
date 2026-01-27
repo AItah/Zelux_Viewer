@@ -797,6 +797,13 @@ class CameraApp(QtWidgets.QMainWindow):
         self._filter_roi_rect: Optional[tuple[int, int, int, int]] = None
         # Which ROI selector is currently active ("fit" or "filter")
         self._roi_target: str = "fit"
+        self._crop_select_mode = False
+        self._crop_dragging = False
+        self._crop_start: Optional[QtCore.QPointF] = None
+        self._crop_current: Optional[QtCore.QPointF] = None
+        self._crop_candidate_rect: Optional[tuple[int, int, int, int]] = None
+        self._crop_rect: Optional[tuple[int, int, int, int]] = None
+        self._crop_enabled = False
         self._axis_lines: list[tuple[tuple[int, int], tuple[int, int], QtGui.QColor]] = []
         self._axis_fit_results = {}
         self._axis_center_px: Optional[tuple[float, float]] = None
@@ -1287,7 +1294,7 @@ class CameraApp(QtWidgets.QMainWindow):
     def _build_filters_window(self) -> QtWidgets.QWidget:
         window = QtWidgets.QWidget(None, QtCore.Qt.WindowType.Window)
         window.setWindowTitle("Filters")
-        window.resize(420, 140)
+        window.resize(520, 520)
 
         layout = QtWidgets.QVBoxLayout(window)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -1418,6 +1425,39 @@ class CameraApp(QtWidgets.QMainWindow):
         roi_layout.addWidget(self.filter_roi_label)
 
         layout.addWidget(roi_group)
+
+        crop_group = QtWidgets.QGroupBox("Crop (pipeline)")
+        crop_layout = QtWidgets.QVBoxLayout(crop_group)
+        crop_layout.setContentsMargins(8, 8, 8, 8)
+        crop_layout.setSpacing(6)
+
+        crop_btn_row = QtWidgets.QHBoxLayout()
+        self.crop_select_btn = QtWidgets.QPushButton("Select Crop")
+        self.crop_select_btn.clicked.connect(self.start_crop_selection)
+        crop_btn_row.addWidget(self.crop_select_btn)
+        self.crop_apply_btn = QtWidgets.QPushButton("Apply Crop")
+        self.crop_apply_btn.clicked.connect(self.apply_crop_selection)
+        crop_btn_row.addWidget(self.crop_apply_btn)
+        self.crop_clear_btn = QtWidgets.QPushButton("Remove Crop")
+        self.crop_clear_btn.clicked.connect(self.remove_crop)
+        crop_btn_row.addWidget(self.crop_clear_btn)
+        crop_btn_row.addStretch(1)
+        crop_layout.addLayout(crop_btn_row)
+
+        crop_margin_row = QtWidgets.QHBoxLayout()
+        crop_margin_row.addWidget(QtWidgets.QLabel("Context margin (px)"))
+        self.crop_margin_spin = QtWidgets.QSpinBox()
+        self.crop_margin_spin.setRange(0, 10000)
+        self.crop_margin_spin.setValue(32)
+        crop_margin_row.addWidget(self.crop_margin_spin)
+        crop_margin_row.addStretch(1)
+        crop_layout.addLayout(crop_margin_row)
+
+        self.crop_label = QtWidgets.QLabel("Crop: full frame")
+        self.crop_label.setWordWrap(True)
+        crop_layout.addWidget(self.crop_label)
+
+        layout.addWidget(crop_group)
 
         self._load_fft_settings()
         window.hide()
@@ -1680,6 +1720,10 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self.last_payload:
             QtWidgets.QMessageBox.information(self, "2D ROI", "Capture or load an image first.")
             return
+        self._crop_select_mode = False
+        self._crop_dragging = False
+        self._crop_start = None
+        self._crop_current = None
         self._roi_target = "fit"
         self._roi_select_mode = True
         self._roi_dragging = False
@@ -1702,6 +1746,10 @@ class CameraApp(QtWidgets.QMainWindow):
         if not self.last_payload:
             QtWidgets.QMessageBox.information(self, "Filter ROI", "Capture or load an image first.")
             return
+        self._crop_select_mode = False
+        self._crop_dragging = False
+        self._crop_start = None
+        self._crop_current = None
         self._roi_target = "filter"
         self._roi_select_mode = True
         self._roi_dragging = False
@@ -1740,6 +1788,53 @@ class CameraApp(QtWidgets.QMainWindow):
         y0 = int(round(min(p1.y(), p2.y())))
         x1 = int(round(max(p1.x(), p2.x())))
         y1 = int(round(max(p1.y(), p2.y())))
+        return x0, y0, x1, y1
+
+    def _expand_bounds(self, start: int, end: int, limit: int, pad: int) -> tuple[int, int]:
+        length = end - start
+        if length <= 0:
+            return start, end
+        left = min(pad, start)
+        right = min(pad, limit - end)
+        if left < pad:
+            right = min(limit - end, right + (pad - left))
+        if right < pad:
+            left = min(start, left + (pad - right))
+        return max(0, start - left), min(limit, end + right)
+
+    def _make_even_bounds(self, start: int, end: int, limit: int) -> tuple[int, int]:
+        length = end - start
+        if length <= 0:
+            return start, end
+        if length % 2 == 0:
+            return start, end
+        if end < limit:
+            return start, end + 1
+        if start > 0:
+            return start - 1, end
+        return start, max(start + 1, end - 1)
+
+    def _fix_crop_rect(
+        self, rect: tuple[int, int, int, int], shape: tuple[int, ...], pad: int
+    ) -> Optional[tuple[int, int, int, int]]:
+        h = int(shape[0]) if len(shape) > 0 else 0
+        w = int(shape[1]) if len(shape) > 1 else 0
+        if h <= 0 or w <= 0:
+            return None
+        x0, y0, x1, y1 = rect
+        x0 = max(0, min(int(x0), w - 1))
+        y0 = max(0, min(int(y0), h - 1))
+        x1 = max(0, min(int(x1), w))
+        y1 = max(0, min(int(y1), h))
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return None
+        pad = max(0, int(pad))
+        x0, x1 = self._expand_bounds(x0, x1, w, pad)
+        y0, y1 = self._expand_bounds(y0, y1, h, pad)
+        x0, x1 = self._make_even_bounds(x0, x1, w)
+        y0, y1 = self._make_even_bounds(y0, y1, h)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
         return x0, y0, x1, y1
 
     def _start_roi_drag(self, event: QtGui.QMouseEvent) -> bool:
@@ -1793,6 +1888,130 @@ class CameraApp(QtWidgets.QMainWindow):
         self._sync_panning_enabled()
         self._refresh_image_view()
         return True
+
+    def start_crop_selection(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "Crop", "Capture or load an image first.")
+            return
+        self._roi_select_mode = False
+        self._roi_dragging = False
+        self._roi_start = None
+        self._roi_current = None
+        self._crop_select_mode = True
+        self._crop_dragging = False
+        self._crop_start = None
+        self._crop_current = None
+        self.status_label.setText("Crop: drag on the image to select a rectangle.")
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+
+    def clear_crop_selection(self):
+        self._crop_select_mode = False
+        self._crop_dragging = False
+        self._crop_start = None
+        self._crop_current = None
+        self._crop_candidate_rect = None
+        self._update_crop_label()
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+
+    def apply_crop_selection(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "Crop", "Capture or load an image first.")
+            return
+        if self._crop_candidate_rect is None:
+            QtWidgets.QMessageBox.information(self, "Crop", "Select a crop rectangle first.")
+            return
+        base_np = self.last_payload.np_image_raw if getattr(self.last_payload, "np_image_raw", None) is not None else self.last_payload.np_image
+        margin = int(getattr(self, "crop_margin_spin", None).value()) if getattr(self, "crop_margin_spin", None) else 0
+        fixed = self._fix_crop_rect(self._crop_candidate_rect, base_np.shape, margin)
+        if fixed is None:
+            QtWidgets.QMessageBox.information(self, "Crop", "Crop selection too small.")
+            return
+        self._crop_rect = fixed
+        self._crop_enabled = True
+        self._crop_candidate_rect = fixed
+        self.clear_fits()
+        self.clear_cross()
+        self.clear_fit_roi_selection()
+        self.clear_filter_roi_selection()
+        self.clear_calibration()
+        self._clear_measure_tools()
+        self._image_filter_mask_cache.clear()
+        self._profile_filter_mask_cache.clear()
+        self._update_crop_label()
+        self.status_label.setText("Crop applied.")
+        if self.last_payload:
+            self._display_frame(self.last_payload)
+
+    def remove_crop(self):
+        if not self._crop_enabled and self._crop_rect is None:
+            return
+        self._crop_enabled = False
+        self._crop_rect = None
+        self._crop_candidate_rect = None
+        self._update_crop_label()
+        self.status_label.setText("Crop removed.")
+        if self.last_payload:
+            self._display_frame(self.last_payload)
+
+    def _start_crop_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if event.button() != QtCore.Qt.MouseButton.LeftButton or not self.last_payload:
+            return False
+        scale = self._last_render_scale or 1.0
+        p = event.position()
+        x, y = self._clamp_point(p.x() / scale, p.y() / scale)
+        self._crop_dragging = True
+        self._crop_start = QtCore.QPointF(x, y)
+        self._crop_current = QtCore.QPointF(x, y)
+        event.accept()
+        self._refresh_image_view()
+        return True
+
+    def _update_crop_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._crop_dragging or self._crop_start is None or not self.last_payload:
+            return False
+        scale = self._last_render_scale or 1.0
+        p = event.position()
+        x, y = self._clamp_point(p.x() / scale, p.y() / scale)
+        self._crop_current = QtCore.QPointF(x, y)
+        event.accept()
+        self._refresh_image_view()
+        return True
+
+    def _finish_crop_drag(self, event: QtGui.QMouseEvent) -> bool:
+        if not self._crop_dragging or self._crop_start is None or self._crop_current is None:
+            return False
+        x0, y0, x1, y1 = self._roi_rect_from_points(self._crop_start, self._crop_current)
+        self._crop_dragging = False
+        self._crop_select_mode = False
+        self._crop_start = None
+        self._crop_current = None
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            self.status_label.setText("Crop selection too small.")
+            self._sync_panning_enabled()
+            self._refresh_image_view()
+            return True
+        self._crop_candidate_rect = (x0, y0, x1, y1)
+        self._update_crop_label()
+        self.status_label.setText("Crop selection ready. Click Apply Crop.")
+        self._sync_panning_enabled()
+        self._refresh_image_view()
+        return True
+
+    def _update_crop_label(self):
+        label = getattr(self, "crop_label", None)
+        if not label:
+            return
+        if self._crop_enabled and self._crop_rect is not None:
+            x0, y0, x1, y1 = self._crop_rect
+            label.setText(f"Crop: x={x0}-{x1}, y={y0}-{y1} ({x1 - x0}x{y1 - y0})")
+            return
+        if self._crop_candidate_rect is not None:
+            x0, y0, x1, y1 = self._crop_candidate_rect
+            label.setText(f"Crop selection: x={x0}-{x1}, y={y0}-{y1} ({x1 - x0}x{y1 - y0})")
+            return
+        label.setText("Crop: full frame")
 
     def _format_fft_param_snapshot(self) -> str:
         dc_radius = int(getattr(self, "fft_dc_radius_spin", None).value()) if getattr(self, "fft_dc_radius_spin", None) else 10
@@ -3015,6 +3234,23 @@ class CameraApp(QtWidgets.QMainWindow):
         raw_np = getattr(payload, "np_image_raw", None)
         if raw_np is None:
             raw_np = payload.np_image
+        if self._crop_enabled and self._crop_rect is not None:
+            h, w = raw_np.shape[:2]
+            x0, y0, x1, y1 = self._crop_rect
+            x0 = max(0, min(int(x0), w - 1))
+            y0 = max(0, min(int(y0), h - 1))
+            x1 = max(0, min(int(x1), w))
+            y1 = max(0, min(int(y1), h))
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                self._crop_enabled = False
+                self._crop_rect = None
+                self._update_crop_label()
+                self.status_label.setText("Crop disabled (invalid for current image).")
+            else:
+                if (x0, y0, x1, y1) != self._crop_rect:
+                    self._crop_rect = (x0, y0, x1, y1)
+                    self._update_crop_label()
+                raw_np = raw_np[y0:y1, x0:x1] if raw_np.ndim == 2 else raw_np[y0:y1, x0:x1, :]
         payload.np_image = raw_np
         payload.pil_image = self._np_to_pil_image(raw_np)
         self._last_fft_timings = None
@@ -3038,6 +3274,13 @@ class CameraApp(QtWidgets.QMainWindow):
                     y1 = min(int(y1), raw_np.shape[0] if raw_np.ndim >= 2 else int(y1))
                     if x1 - x0 < 5 or y1 - y0 < 5:
                         roi = None
+                    else:
+                        pad = max(16, mask_radius * 4, dc_radius * 2)
+                        width = raw_np.shape[1] if raw_np.ndim >= 2 else x1
+                        height = raw_np.shape[0] if raw_np.ndim >= 2 else y1
+                        x0p, x1p = self._expand_bounds(x0, x1, width, pad)
+                        y0p, y1p = self._expand_bounds(y0, y1, height, pad)
+                        roi = (x0, y0, x1, y1, x0p, y0p, x1p, y1p)
 
                 if getattr(self, "_fft_steps_enabled", False):
                     if roi is None:
@@ -3052,8 +3295,12 @@ class CameraApp(QtWidgets.QMainWindow):
                             analysis_scale=analysis_scale,
                         )
                     else:
-                        x0, y0, x1, y1 = roi
-                        sub = raw_np[y0:y1, x0:x1] if raw_np.ndim == 2 else raw_np[y0:y1, x0:x1, :]
+                        x0, y0, x1, y1, x0p, y0p, x1p, y1p = roi
+                        sub = (
+                            raw_np[y0p:y1p, x0p:x1p]
+                            if raw_np.ndim == 2
+                            else raw_np[y0p:y1p, x0p:x1p, :]
+                        )
                         cleaned_sub, steps = fft_clean_image_steps(
                             sub,
                             mask_radius=mask_radius,
@@ -3066,9 +3313,13 @@ class CameraApp(QtWidgets.QMainWindow):
                         )
                         cleaned = raw_np.copy()
                         if cleaned.ndim == 2:
-                            cleaned[y0:y1, x0:x1] = cleaned_sub
+                            cleaned[y0:y1, x0:x1] = cleaned_sub[
+                                y0 - y0p : y1 - y0p, x0 - x0p : x1 - x0p
+                            ]
                         else:
-                            cleaned[y0:y1, x0:x1, :] = cleaned_sub
+                            cleaned[y0:y1, x0:x1, :] = cleaned_sub[
+                                y0 - y0p : y1 - y0p, x0 - x0p : x1 - x0p, :
+                            ]
                 else:
                     steps = {"timings": None}
                     if roi is None:
@@ -3083,8 +3334,12 @@ class CameraApp(QtWidgets.QMainWindow):
                             analysis_scale=analysis_scale,
                         )
                     else:
-                        x0, y0, x1, y1 = roi
-                        sub = raw_np[y0:y1, x0:x1] if raw_np.ndim == 2 else raw_np[y0:y1, x0:x1, :]
+                        x0, y0, x1, y1, x0p, y0p, x1p, y1p = roi
+                        sub = (
+                            raw_np[y0p:y1p, x0p:x1p]
+                            if raw_np.ndim == 2
+                            else raw_np[y0p:y1p, x0p:x1p, :]
+                        )
                         cleaned_sub = fft_clean_image(
                             sub,
                             mask_radius=mask_radius,
@@ -3097,9 +3352,13 @@ class CameraApp(QtWidgets.QMainWindow):
                         )
                         cleaned = raw_np.copy()
                         if cleaned.ndim == 2:
-                            cleaned[y0:y1, x0:x1] = cleaned_sub
+                            cleaned[y0:y1, x0:x1] = cleaned_sub[
+                                y0 - y0p : y1 - y0p, x0 - x0p : x1 - x0p
+                            ]
                         else:
-                            cleaned[y0:y1, x0:x1, :] = cleaned_sub
+                            cleaned[y0:y1, x0:x1, :] = cleaned_sub[
+                                y0 - y0p : y1 - y0p, x0 - x0p : x1 - x0p, :
+                            ]
 
                 if steps:
                     self._last_fft_timings = steps.get("timings")
@@ -5286,6 +5545,7 @@ class CameraApp(QtWidgets.QMainWindow):
         img = self._np_to_pil_image(base_np)
         if self._gauss_fit:
             img = self._draw_gaussian_contour(img, self._gauss_fit)
+        img = self._draw_crop_overlay(img)
         img = self._draw_roi_overlay(img)
         if len(self._line_points) == 2:
             img = self._draw_line_segment(img, self._line_points, color=(255, 215, 0))
@@ -5580,6 +5840,23 @@ class CameraApp(QtWidgets.QMainWindow):
         draw.rectangle(rect, fill=(0, 0, 0, 128))
         draw.text((text_x, text_y), text, fill=(255, 215, 0, 255), font=font)
         return base.convert("RGB") if image.mode != "RGBA" else base
+
+    def _draw_crop_overlay(self, image: Image.Image) -> Image.Image:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        draw = ImageDraw.Draw(image)
+        if self._crop_dragging and self._crop_start is not None and self._crop_current is not None:
+            x0, y0, x1, y1 = self._roi_rect_from_points(self._crop_start, self._crop_current)
+            if x1 > x0 and y1 > y0:
+                draw.rectangle((x0, y0, x1, y1), outline=(255, 215, 0), width=2)
+            return image
+        if self._crop_candidate_rect is not None and (
+            not self._crop_enabled or self._crop_candidate_rect != self._crop_rect
+        ):
+            x0, y0, x1, y1 = self._crop_candidate_rect
+            if x1 > x0 and y1 > y0:
+                draw.rectangle((x0, y0, x1, y1), outline=(255, 215, 0), width=2)
+        return image
 
     def _draw_roi_overlay(self, image: Image.Image) -> Image.Image:
         if image.mode != "RGB":
@@ -6043,6 +6320,16 @@ class CameraApp(QtWidgets.QMainWindow):
             if self._handle_wheel_zoom(event, obj):
                 return True
         elif obj is getattr(self, "image_label", None):
+            if self._crop_select_mode or self._crop_dragging:
+                if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                    if self._start_crop_drag(event):
+                        return True
+                elif event.type() == QtCore.QEvent.Type.MouseMove:
+                    if self._update_crop_drag(event):
+                        return True
+                elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                    if self._finish_crop_drag(event):
+                        return True
             if self._roi_select_mode or self._roi_dragging:
                 if event.type() == QtCore.QEvent.Type.MouseButtonPress:
                     if self._start_roi_drag(event):
@@ -6299,6 +6586,8 @@ class CameraApp(QtWidgets.QMainWindow):
                 not self._fit_to_window
                 and not self._roi_select_mode
                 and not self._roi_dragging
+                and not self._crop_select_mode
+                and not self._crop_dragging
                 and not self._line_edit_mode
                 and not self._calibration_dragging
                 and not self._measure_line_dragging
