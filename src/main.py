@@ -791,7 +791,12 @@ class CameraApp(QtWidgets.QMainWindow):
         self._roi_dragging = False
         self._roi_start: Optional[QtCore.QPointF] = None
         self._roi_current: Optional[QtCore.QPointF] = None
+        # ROI used for 2D fitting (selected from Fit window)
         self._roi_rect: Optional[tuple[int, int, int, int]] = None
+        # ROI used for live FFT cleaning / FFT filtering (selected from Filters window)
+        self._filter_roi_rect: Optional[tuple[int, int, int, int]] = None
+        # Which ROI selector is currently active ("fit" or "filter")
+        self._roi_target: str = "fit"
         self._axis_lines: list[tuple[tuple[int, int], tuple[int, int], QtGui.QColor]] = []
         self._axis_fit_results = {}
         self._axis_center_px: Optional[tuple[float, float]] = None
@@ -818,6 +823,10 @@ class CameraApp(QtWidgets.QMainWindow):
         self._last_fft_timings: Optional[dict] = None
         self._fft_toggle_log_pending: Optional[dict] = None
         self._fft_log_path = os.path.join(DATA_DIR, "fft_timing_log.txt")
+        # Cache FFT filter masks to avoid per-frame meshgrid/sqrt.
+        self._image_filter_mask_cache: dict[tuple[int, int, str, float, float], np.ndarray] = {}
+        # Cache 1D profile FFT masks.
+        self._profile_filter_mask_cache: dict[tuple[int, str, float, float], np.ndarray] = {}
 
         self._restore_window_state(self, "main_window")
         self.setWindowTitle("Live View - No camera")
@@ -1385,6 +1394,31 @@ class CameraApp(QtWidgets.QMainWindow):
         self.fft_timing_label.setWordWrap(True)
         layout.addWidget(self.fft_timing_label)
 
+        roi_group = QtWidgets.QGroupBox("ROI (performance)")
+        roi_layout = QtWidgets.QVBoxLayout(roi_group)
+        roi_layout.setContentsMargins(8, 8, 8, 8)
+        roi_layout.setSpacing(6)
+
+        self.filter_roi_checkbox = QtWidgets.QCheckBox("Use ROI for FFT cleaning + FFT filters")
+        self.filter_roi_checkbox.stateChanged.connect(self._on_filter_roi_changed)
+        roi_layout.addWidget(self.filter_roi_checkbox)
+
+        roi_btn_row = QtWidgets.QHBoxLayout()
+        self.filter_roi_btn = QtWidgets.QPushButton("Select Filter ROI")
+        self.filter_roi_btn.clicked.connect(self.start_filter_roi_selection)
+        roi_btn_row.addWidget(self.filter_roi_btn)
+        self.filter_roi_clear_btn = QtWidgets.QPushButton("Clear ROI")
+        self.filter_roi_clear_btn.clicked.connect(self.clear_filter_roi_selection)
+        roi_btn_row.addWidget(self.filter_roi_clear_btn)
+        roi_btn_row.addStretch(1)
+        roi_layout.addLayout(roi_btn_row)
+
+        self.filter_roi_label = QtWidgets.QLabel("Filter ROI: full frame")
+        self.filter_roi_label.setWordWrap(True)
+        roi_layout.addWidget(self.filter_roi_label)
+
+        layout.addWidget(roi_group)
+
         self._load_fft_settings()
         window.hide()
         return window
@@ -1443,8 +1477,13 @@ class CameraApp(QtWidgets.QMainWindow):
     def _load_fft_settings(self):
         if not getattr(self, "_settings", None):
             return
-        enabled = False
+        enabled = self._settings.value("fft/clean_enabled", False, type=bool)
         steps_enabled = self._settings.value("fft/steps_enabled", False, type=bool)
+        roi_enabled = self._settings.value("fft/roi_enabled", False, type=bool)
+        roi_x0 = self._settings.value("fft/roi/x0", 0, type=int)
+        roi_y0 = self._settings.value("fft/roi/y0", 0, type=int)
+        roi_x1 = self._settings.value("fft/roi/x1", 0, type=int)
+        roi_y1 = self._settings.value("fft/roi/y1", 0, type=int)
         params = {
             "fft/dc_radius": 10,
             "fft/mask_radius": 8,
@@ -1482,6 +1521,15 @@ class CameraApp(QtWidgets.QMainWindow):
             self.fft_steps_checkbox.setChecked(bool(steps_enabled))
             self.fft_steps_checkbox.blockSignals(False)
             self._fft_steps_enabled = bool(steps_enabled)
+        if getattr(self, "filter_roi_checkbox", None):
+            self.filter_roi_checkbox.blockSignals(True)
+            self.filter_roi_checkbox.setChecked(bool(roi_enabled))
+            self.filter_roi_checkbox.blockSignals(False)
+        if roi_x1 > roi_x0 and roi_y1 > roi_y0:
+            self._filter_roi_rect = (int(roi_x0), int(roi_y0), int(roi_x1), int(roi_y1))
+        else:
+            self._filter_roi_rect = None
+        self._update_filter_roi_label()
 
     def _save_fft_settings(self):
         if not getattr(self, "_settings", None):
@@ -1490,6 +1538,19 @@ class CameraApp(QtWidgets.QMainWindow):
             self._settings.setValue("fft/clean_enabled", self.fft_clean_btn.isChecked())
         if getattr(self, "fft_steps_checkbox", None):
             self._settings.setValue("fft/steps_enabled", self.fft_steps_checkbox.isChecked())
+        if getattr(self, "filter_roi_checkbox", None):
+            self._settings.setValue("fft/roi_enabled", self.filter_roi_checkbox.isChecked())
+        if self._filter_roi_rect is not None:
+            x0, y0, x1, y1 = self._filter_roi_rect
+            self._settings.setValue("fft/roi/x0", int(x0))
+            self._settings.setValue("fft/roi/y0", int(y0))
+            self._settings.setValue("fft/roi/x1", int(x1))
+            self._settings.setValue("fft/roi/y1", int(y1))
+        else:
+            self._settings.setValue("fft/roi/x0", 0)
+            self._settings.setValue("fft/roi/y0", 0)
+            self._settings.setValue("fft/roi/x1", 0)
+            self._settings.setValue("fft/roi/y1", 0)
         if getattr(self, "fft_dc_radius_spin", None):
             self._settings.setValue("fft/dc_radius", int(self.fft_dc_radius_spin.value()))
         if getattr(self, "fft_mask_radius_spin", None):
@@ -1605,10 +1666,21 @@ class CameraApp(QtWidgets.QMainWindow):
         x0, y0, x1, y1 = self._roi_rect
         label.setText(f"2D ROI: x={x0}-{x1}, y={y0}-{y1} ({x1 - x0}x{y1 - y0})")
 
+    def _update_filter_roi_label(self):
+        label = getattr(self, "filter_roi_label", None)
+        if not label:
+            return
+        if self._filter_roi_rect is None:
+            label.setText("Filter ROI: full frame")
+            return
+        x0, y0, x1, y1 = self._filter_roi_rect
+        label.setText(f"Filter ROI: x={x0}-{x1}, y={y0}-{y1} ({x1 - x0}x{y1 - y0})")
+
     def start_fit_roi_selection(self):
         if not self.last_payload:
             QtWidgets.QMessageBox.information(self, "2D ROI", "Capture or load an image first.")
             return
+        self._roi_target = "fit"
         self._roi_select_mode = True
         self._roi_dragging = False
         self._roi_start = None
@@ -1625,6 +1697,43 @@ class CameraApp(QtWidgets.QMainWindow):
         self._update_fit_roi_label()
         self._refresh_image_view()
         self._sync_panning_enabled()
+
+    def start_filter_roi_selection(self):
+        if not self.last_payload:
+            QtWidgets.QMessageBox.information(self, "Filter ROI", "Capture or load an image first.")
+            return
+        self._roi_target = "filter"
+        self._roi_select_mode = True
+        self._roi_dragging = False
+        self._roi_start = None
+        self._roi_current = None
+        self.status_label.setText("Filter ROI: drag on the image to select a rectangle.")
+        self._sync_panning_enabled()
+
+    def clear_filter_roi_selection(self):
+        self._roi_select_mode = False
+        self._roi_dragging = False
+        self._roi_start = None
+        self._roi_current = None
+        self._filter_roi_rect = None
+        self._update_filter_roi_label()
+        # ROI change can affect performance and outputs; clear caches and rerun transforms
+        self._image_filter_mask_cache.clear()
+        self._profile_filter_mask_cache.clear()
+        if self.last_payload:
+            self._filtered_np_image_untransformed = self._apply_image_filter_np(self.last_payload.np_image)
+            self._rebuild_view_transforms()
+        self._refresh_image_view()
+        self._sync_panning_enabled()
+
+    def _on_filter_roi_changed(self, *args):
+        # ROI toggle affects which portion is filtered/cleaned; clear caches and recompute.
+        self._image_filter_mask_cache.clear()
+        self._profile_filter_mask_cache.clear()
+        if self.last_payload:
+            self._filtered_np_image_untransformed = self._apply_image_filter_np(self.last_payload.np_image)
+            self._rebuild_view_transforms()
+            self._refresh_image_view()
 
     def _roi_rect_from_points(self, p1: QtCore.QPointF, p2: QtCore.QPointF) -> tuple[int, int, int, int]:
         x0 = int(round(min(p1.x(), p2.x())))
@@ -1666,13 +1775,21 @@ class CameraApp(QtWidgets.QMainWindow):
         self._roi_start = None
         self._roi_current = None
         if x1 - x0 < 5 or y1 - y0 < 5:
-            self.status_label.setText("2D ROI: selection too small.")
+            self.status_label.setText("ROI selection too small.")
             self._sync_panning_enabled()
             self._refresh_image_view()
             return True
-        self._roi_rect = (x0, y0, x1, y1)
-        self._update_fit_roi_label()
-        self.status_label.setText("2D ROI updated.")
+        if getattr(self, "_roi_target", "fit") == "filter":
+            self._filter_roi_rect = (x0, y0, x1, y1)
+            self._update_filter_roi_label()
+            # ROI changes invalidate cached masks
+            self._image_filter_mask_cache.clear()
+            self._profile_filter_mask_cache.clear()
+            self.status_label.setText("Filter ROI updated.")
+        else:
+            self._roi_rect = (x0, y0, x1, y1)
+            self._update_fit_roi_label()
+            self.status_label.setText("2D ROI updated.")
         self._sync_panning_enabled()
         self._refresh_image_view()
         return True
@@ -2749,6 +2866,9 @@ class CameraApp(QtWidgets.QMainWindow):
         enabled = self.fft_clean_btn.isChecked()
         self._fft_enabled = enabled
         self._save_fft_settings()
+        # ROI + FFT changes can affect cached FFT masks.
+        self._image_filter_mask_cache.clear()
+        self._profile_filter_mask_cache.clear()
         self._fft_toggle_log_pending = {
             "action": "enable" if enabled else "disable",
             "start": time.perf_counter(),
@@ -2762,6 +2882,9 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _on_fft_params_changed(self, *args):
         self._save_fft_settings()
+        # Changing FFT params invalidates cached masks for FFT filtering and profile filters.
+        self._image_filter_mask_cache.clear()
+        self._profile_filter_mask_cache.clear()
         if self._fft_enabled and self.last_payload:
             self._display_frame(self.last_payload)
     
@@ -2897,7 +3020,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self._last_fft_timings = None
         if getattr(self, "_fft_enabled", False):
             try:
-                from beam_profile_fitting import fft_clean_image_steps
+                from beam_profile_fitting import fft_clean_image, fft_clean_image_steps
                 mask_radius = int(getattr(self, "fft_mask_radius_spin", None).value()) if getattr(self, "fft_mask_radius_spin", None) else 8
                 threshold_sigma = float(getattr(self, "fft_sigma_spin", None).value()) if getattr(self, "fft_sigma_spin", None) else 5.0
                 dc_radius = int(getattr(self, "fft_dc_radius_spin", None).value()) if getattr(self, "fft_dc_radius_spin", None) else 10
@@ -2905,16 +3028,79 @@ class CameraApp(QtWidgets.QMainWindow):
                 min_sep = int(getattr(self, "fft_min_sep_spin", None).value()) if getattr(self, "fft_min_sep_spin", None) else 10
                 max_pairs = int(getattr(self, "fft_max_pairs_spin", None).value()) if getattr(self, "fft_max_pairs_spin", None) else 80
                 analysis_scale = int(getattr(self, "fft_analysis_scale_spin", None).value()) if getattr(self, "fft_analysis_scale_spin", None) else 1
-                cleaned, steps = fft_clean_image_steps(
-                    raw_np,
-                    mask_radius=mask_radius,
-                    threshold_sigma=threshold_sigma,
-                    dc_radius=dc_radius,
-                    pair_tol=pair_tol,
-                    min_sep=min_sep,
-                    max_pairs=max_pairs,
-                    analysis_scale=analysis_scale,
-                )
+                use_roi = bool(getattr(self, "filter_roi_checkbox", None) and self.filter_roi_checkbox.isChecked())
+                roi = self._filter_roi_rect if use_roi else None
+                if roi is not None:
+                    x0, y0, x1, y1 = roi
+                    x0 = max(0, int(x0))
+                    y0 = max(0, int(y0))
+                    x1 = min(int(x1), raw_np.shape[1] if raw_np.ndim >= 2 else int(x1))
+                    y1 = min(int(y1), raw_np.shape[0] if raw_np.ndim >= 2 else int(y1))
+                    if x1 - x0 < 5 or y1 - y0 < 5:
+                        roi = None
+
+                if getattr(self, "_fft_steps_enabled", False):
+                    if roi is None:
+                        cleaned, steps = fft_clean_image_steps(
+                            raw_np,
+                            mask_radius=mask_radius,
+                            threshold_sigma=threshold_sigma,
+                            dc_radius=dc_radius,
+                            pair_tol=pair_tol,
+                            min_sep=min_sep,
+                            max_pairs=max_pairs,
+                            analysis_scale=analysis_scale,
+                        )
+                    else:
+                        x0, y0, x1, y1 = roi
+                        sub = raw_np[y0:y1, x0:x1] if raw_np.ndim == 2 else raw_np[y0:y1, x0:x1, :]
+                        cleaned_sub, steps = fft_clean_image_steps(
+                            sub,
+                            mask_radius=mask_radius,
+                            threshold_sigma=threshold_sigma,
+                            dc_radius=dc_radius,
+                            pair_tol=pair_tol,
+                            min_sep=min_sep,
+                            max_pairs=max_pairs,
+                            analysis_scale=analysis_scale,
+                        )
+                        cleaned = raw_np.copy()
+                        if cleaned.ndim == 2:
+                            cleaned[y0:y1, x0:x1] = cleaned_sub
+                        else:
+                            cleaned[y0:y1, x0:x1, :] = cleaned_sub
+                else:
+                    steps = {"timings": None}
+                    if roi is None:
+                        cleaned = fft_clean_image(
+                            raw_np,
+                            mask_radius=mask_radius,
+                            threshold_sigma=threshold_sigma,
+                            dc_radius=dc_radius,
+                            pair_tol=pair_tol,
+                            min_sep=min_sep,
+                            max_pairs=max_pairs,
+                            analysis_scale=analysis_scale,
+                        )
+                    else:
+                        x0, y0, x1, y1 = roi
+                        sub = raw_np[y0:y1, x0:x1] if raw_np.ndim == 2 else raw_np[y0:y1, x0:x1, :]
+                        cleaned_sub = fft_clean_image(
+                            sub,
+                            mask_radius=mask_radius,
+                            threshold_sigma=threshold_sigma,
+                            dc_radius=dc_radius,
+                            pair_tol=pair_tol,
+                            min_sep=min_sep,
+                            max_pairs=max_pairs,
+                            analysis_scale=analysis_scale,
+                        )
+                        cleaned = raw_np.copy()
+                        if cleaned.ndim == 2:
+                            cleaned[y0:y1, x0:x1] = cleaned_sub
+                        else:
+                            cleaned[y0:y1, x0:x1, :] = cleaned_sub
+
                 if steps:
                     self._last_fft_timings = steps.get("timings")
                 payload.np_image = cleaned
@@ -4713,11 +4899,34 @@ class CameraApp(QtWidgets.QMainWindow):
         if mode_text == "None" or n < 2:
             return data
         global _GPU_FFT_AVAILABLE, _GPU_FFT_ERROR
+        cache_key = (int(n), str(mode_text), float(low_cut), float(high_cut))
 
         def _cpu_filter(arr: np.ndarray) -> np.ndarray:
             if _HAVE_SCIPY_FFT:
                 freqs = scipy_fft.rfftfreq(n, d=1.0)
                 spectrum = scipy_fft.rfft(arr, workers=-1)
+                mask = self._profile_filter_mask_cache.get(cache_key)
+                if mask is None:
+                    if mode_text == "Low-pass":
+                        mask = freqs <= high_cut
+                    elif mode_text == "High-pass":
+                        mask = freqs >= low_cut
+                    elif mode_text == "Band-pass":
+                        if low_cut >= high_cut:
+                            mask = freqs >= low_cut
+                        else:
+                            mask = (freqs >= low_cut) & (freqs <= high_cut)
+                    else:
+                        return arr
+                    self._profile_filter_mask_cache[cache_key] = np.asarray(mask, dtype=bool)
+                if not np.any(mask):
+                    return arr
+                filtered = scipy_fft.irfft(spectrum * mask, n=n, workers=-1)
+                return np.asarray(filtered, dtype=np.float64)
+            freqs = np.fft.rfftfreq(n, d=1.0)
+            spectrum = np.fft.rfft(arr)
+            mask = self._profile_filter_mask_cache.get(cache_key)
+            if mask is None:
                 if mode_text == "Low-pass":
                     mask = freqs <= high_cut
                 elif mode_text == "High-pass":
@@ -4729,23 +4938,7 @@ class CameraApp(QtWidgets.QMainWindow):
                         mask = (freqs >= low_cut) & (freqs <= high_cut)
                 else:
                     return arr
-                if not np.any(mask):
-                    return arr
-                filtered = scipy_fft.irfft(spectrum * mask, n=n, workers=-1)
-                return np.asarray(filtered, dtype=np.float64)
-            freqs = np.fft.rfftfreq(n, d=1.0)
-            spectrum = np.fft.rfft(arr)
-            if mode_text == "Low-pass":
-                mask = freqs <= high_cut
-            elif mode_text == "High-pass":
-                mask = freqs >= low_cut
-            elif mode_text == "Band-pass":
-                if low_cut >= high_cut:
-                    mask = freqs >= low_cut
-                else:
-                    mask = (freqs >= low_cut) & (freqs <= high_cut)
-            else:
-                return arr
+                self._profile_filter_mask_cache[cache_key] = np.asarray(mask, dtype=bool)
             if not np.any(mask):
                 return arr
             filtered = np.fft.irfft(spectrum * mask, n=n)
@@ -4793,6 +4986,16 @@ class CameraApp(QtWidgets.QMainWindow):
             return data
 
         arr = np.asarray(data, dtype=np.float64)
+        use_roi = bool(getattr(self, "filter_roi_checkbox", None) and self.filter_roi_checkbox.isChecked())
+        roi = self._filter_roi_rect if use_roi else None
+        if roi is not None and arr.ndim >= 2:
+            x0, y0, x1, y1 = roi
+            x0 = max(0, int(x0))
+            y0 = max(0, int(y0))
+            x1 = min(int(x1), int(arr.shape[1]))
+            y1 = min(int(y1), int(arr.shape[0]))
+            if x1 - x0 < 5 or y1 - y0 < 5:
+                roi = None
 
         def filter_channel(chan: np.ndarray) -> np.ndarray:
             if chan.ndim != 2:
@@ -4829,21 +5032,26 @@ class CameraApp(QtWidgets.QMainWindow):
                     _GPU_FFT_ERROR = f"{type(exc).__name__}: {exc}"
 
             if _HAVE_SCIPY_FFT:
-                fy = scipy_fft.fftfreq(h, d=1.0)
-                fx = scipy_fft.fftfreq(w, d=1.0)
-                fx_grid, fy_grid = np.meshgrid(fx, fy)
-                radius = np.sqrt(fx_grid * fx_grid + fy_grid * fy_grid)
-                if mode_text == "Low-pass":
-                    mask = radius <= high_cut
-                elif mode_text == "High-pass":
-                    mask = radius >= low_cut
-                elif mode_text == "Band-pass":
-                    if low_cut >= high_cut:
+                key = (int(h), int(w), str(mode_text), float(low_cut), float(high_cut))
+                mask = self._image_filter_mask_cache.get(key)
+                if mask is None:
+                    fy = scipy_fft.fftfreq(h, d=1.0)
+                    fx = scipy_fft.fftfreq(w, d=1.0)
+                    fx_grid, fy_grid = np.meshgrid(fx, fy)
+                    radius = np.sqrt(fx_grid * fx_grid + fy_grid * fy_grid)
+                    if mode_text == "Low-pass":
+                        mask = radius <= high_cut
+                    elif mode_text == "High-pass":
                         mask = radius >= low_cut
+                    elif mode_text == "Band-pass":
+                        if low_cut >= high_cut:
+                            mask = radius >= low_cut
+                        else:
+                            mask = (radius >= low_cut) & (radius <= high_cut)
                     else:
-                        mask = (radius >= low_cut) & (radius <= high_cut)
-                else:
-                    return chan
+                        return chan
+                    mask = np.asarray(mask, dtype=np.float32)
+                    self._image_filter_mask_cache[key] = mask
                 if not np.any(mask):
                     return chan
                 spec = scipy_fft.fft2(chan, workers=-1)
@@ -4871,13 +5079,25 @@ class CameraApp(QtWidgets.QMainWindow):
             filtered = np.fft.ifft2(spec * mask).real
             return filtered
 
-        if arr.ndim == 2:
-            filtered = filter_channel(arr)
-        elif arr.ndim == 3 and arr.shape[2] >= 1:
-            channels = [filter_channel(arr[..., c]) for c in range(arr.shape[2])]
-            filtered = np.stack(channels, axis=2)
+        if roi is not None and arr.ndim in (2, 3):
+            x0, y0, x1, y1 = roi
+            if arr.ndim == 2:
+                filtered_roi = filter_channel(arr[y0:y1, x0:x1])
+                filtered = arr.copy()
+                filtered[y0:y1, x0:x1] = filtered_roi
+            else:
+                filtered = arr.copy()
+                for c in range(arr.shape[2]):
+                    filtered_roi = filter_channel(arr[y0:y1, x0:x1, c])
+                    filtered[y0:y1, x0:x1, c] = filtered_roi
         else:
-            return data
+            if arr.ndim == 2:
+                filtered = filter_channel(arr)
+            elif arr.ndim == 3 and arr.shape[2] >= 1:
+                channels = [filter_channel(arr[..., c]) for c in range(arr.shape[2])]
+                filtered = np.stack(channels, axis=2)
+            else:
+                return data
 
         if np.issubdtype(data.dtype, np.integer):
             info = np.iinfo(data.dtype)
@@ -4945,6 +5165,9 @@ class CameraApp(QtWidgets.QMainWindow):
 
     def _on_filter_changed(self, *args):
         self._sync_filter_controls()
+        # Filter params affect FFT masks; clear caches so they rebuild once with new settings.
+        self._image_filter_mask_cache.clear()
+        self._profile_filter_mask_cache.clear()
         if self.last_payload:
             self._filtered_np_image_untransformed = self._apply_image_filter_np(self.last_payload.np_image)
             self._rebuild_view_transforms()
@@ -5359,22 +5582,28 @@ class CameraApp(QtWidgets.QMainWindow):
         return base.convert("RGB") if image.mode != "RGBA" else base
 
     def _draw_roi_overlay(self, image: Image.Image) -> Image.Image:
-        rect = None
-        if self._roi_dragging and self._roi_start is not None and self._roi_current is not None:
-            rect = self._roi_rect_from_points(self._roi_start, self._roi_current)
-        elif self._roi_rect is not None:
-            rect = self._roi_rect
-        if rect is None:
-            return image
-
-        x0, y0, x1, y1 = rect
-        if x1 <= x0 or y1 <= y0:
-            return image
-
         if image.mode != "RGB":
             image = image.convert("RGB")
         draw = ImageDraw.Draw(image)
-        draw.rectangle((x0, y0, x1, y1), outline=(0, 255, 128), width=2)
+
+        # Active drag rectangle (either fit ROI or filter ROI)
+        if self._roi_dragging and self._roi_start is not None and self._roi_current is not None:
+            rect = self._roi_rect_from_points(self._roi_start, self._roi_current)
+            x0, y0, x1, y1 = rect
+            if x1 > x0 and y1 > y0:
+                color = (0, 255, 128) if getattr(self, "_roi_target", "fit") != "filter" else (255, 0, 255)
+                draw.rectangle((x0, y0, x1, y1), outline=color, width=2)
+            return image
+
+        # Persisted ROIs
+        if self._roi_rect is not None:
+            x0, y0, x1, y1 = self._roi_rect
+            if x1 > x0 and y1 > y0:
+                draw.rectangle((x0, y0, x1, y1), outline=(0, 255, 128), width=2)
+        if self._filter_roi_rect is not None and getattr(self, "filter_roi_checkbox", None) and self.filter_roi_checkbox.isChecked():
+            x0, y0, x1, y1 = self._filter_roi_rect
+            if x1 > x0 and y1 > y0:
+                draw.rectangle((x0, y0, x1, y1), outline=(255, 0, 255), width=2)
         return image
 
     def compute_gaussian_fit(self):
