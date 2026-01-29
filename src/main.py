@@ -2387,7 +2387,7 @@ class CameraApp(QtWidgets.QMainWindow):
         self.exposure_value_label = QtWidgets.QLabel(f"{int(exp_val)} us")
         grid.addWidget(self.exposure_value_label, 0, 5)
 
-        fine_min, fine_max = 1, 1_000_000  # 1 us to 1000 ms
+        fine_min, fine_max = 1, 5000  # 1 us to 5000 us
         grid.addWidget(QtWidgets.QLabel("Fine Exp (us)"), 1, 0)
         self.exposure_fine_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.exposure_fine_slider.setRange(fine_min, fine_max)
