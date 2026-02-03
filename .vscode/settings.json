@@ -28,4 +28,12 @@
 
   "python.terminal.activateEnvironment": true,
   "python.terminal.activateEnvInCurrentTerminal": true,
+
+  "terminal.integrated.shellIntegration.enabled": true,
+
+  "python.defaultInterpreterPath": ".venv\\Scripts\\python",
+  "terminal.integrated.env.windows": {
+    "VIRTUAL_ENV": "${workspaceFolder}\\.venv",
+    "PATH": "${workspaceFolder}\\.venv\\Scripts;${env:PATH}"
+  }
 }
